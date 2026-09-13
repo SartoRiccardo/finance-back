@@ -114,8 +114,16 @@ async def create_draft_from_content(
     categories = (await db.scalars(select(Category).order_by(Category.sort_order))).all()
     cat_ids = {c.name.lower(): c.id for c in categories}
 
+    # Routes that ignore response_format still read the prompt — carry the shape there too,
+    # with each category's description so the model can match on meaning, not just names.
+    menu = " | ".join(f"{c.name} ({c.description})" if c.description else c.name for c in categories)
+    shape = (
+        "Respond with ONLY a JSON object (no markdown, no prose) shaped "
+        '{"rows": [{"date": "YYYY-MM-DD", "description": "short item", "amount": 12.34, '
+        '"category": "<best fit: ' + menu + '">}]}'
+    )
     raw, usage = await llm.complete_structured(
-        rows_schema([c.name for c in categories]), [prompt, payload]
+        rows_schema([c.name for c in categories]), [f"{prompt}\n\n{shape}", payload]
     )
     rows = _rows_from_llm(raw, cat_ids, cat_ids["misc"])
 
