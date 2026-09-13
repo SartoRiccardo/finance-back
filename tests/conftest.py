@@ -8,7 +8,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool, StaticPool
+from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 from app.db import get_db
@@ -49,10 +49,14 @@ async def _pg_engine():
 
 
 @pytest.fixture(params=["sqlite", "postgres"], ids=["sqlite", "pg"])
-async def db(request):
-    """Every feature test runs on in-memory sqlite AND on real Postgres (when reachable)."""
+async def db(request, tmp_path):
+    """Every feature test runs on file sqlite AND on real Postgres (when reachable).
+
+    File, not :memory:+StaticPool: detached draft extraction runs its own connections,
+    and one shared connection can't host two overlapping transactions.
+    """
     if request.param == "sqlite":
-        engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/pf.db")
     else:
         engine = await _pg_engine()
         if engine is None:
@@ -77,6 +81,10 @@ def make_client(db):
                 yield session
 
         app.dependency_overrides[get_db] = override
+        # detached draft extraction must run against the test DB, not a fresh engine
+        from app.drafts import get_db_factory
+
+        app.dependency_overrides[get_db_factory] = lambda: db
         return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
     return _make

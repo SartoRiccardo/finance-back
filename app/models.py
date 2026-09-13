@@ -116,10 +116,27 @@ class Draft(TimestampMixin, Base):
     # email_meta / source='email' are V6's; nullable until then.
     email_meta: Mapped[dict | None] = mapped_column(JsonDict)
     raw_llm_output: Mapped[dict | None] = mapped_column(JsonDict)
-    status: Mapped[str] = mapped_column(String(8), default="open", server_default="open")
+    # processing → open|error (extraction runs detached from the request)
+    status: Mapped[str] = mapped_column(String(16), default="open", server_default="open")
+    error: Mapped[str | None] = mapped_column(String(500))
 
     upload: Mapped[Upload | None] = relationship(lazy="selectin")
     rows: Mapped[list[Transaction]] = relationship(foreign_keys="Transaction.draft_id", lazy="selectin")
+
+
+class LLMUsage(TimestampMixin, Base):
+    """One row per extraction call — the ironic cost of our readings."""
+
+    __tablename__ = "llm_usage"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16))
+    model: Mapped[str] = mapped_column(String(120))
+    input_tokens: Mapped[int | None]
+    output_tokens: Mapped[int | None]
+    # USD; computed from picker prices at write time (None when no price is known)
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    draft_id: Mapped[int | None] = mapped_column(ForeignKey("drafts.id"))
 
 
 class AppSetting(Base):

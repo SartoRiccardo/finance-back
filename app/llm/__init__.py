@@ -9,17 +9,21 @@ import base64
 import json
 import re
 import time
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal, DecimalException
 from typing import Literal, Protocol
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_app_settings, get_current_user
 from app.config import Settings
 from app.db import SessionLocal, get_db
-from app.models import AppSetting
+from app.models import AppSetting, LLMUsage
 
 # A prompt/email is str; an image is (bytes, mime_type).
 Part = str | tuple[bytes, str]
@@ -29,8 +33,17 @@ class LLMError(Exception):
     """Provider failure, missing key, or unparseable output — surfaced as 502."""
 
 
+@dataclass(frozen=True)
+class Usage:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
 class LLMClient(Protocol):
-    async def complete_structured(self, schema: dict, contents: list[Part]) -> dict: ...
+    provider: str
+    model: str
+
+    async def complete_structured(self, schema: dict, contents: list[Part]) -> tuple[dict, Usage]: ...
 
 
 def rows_schema(category_names: list[str]) -> dict:
@@ -68,10 +81,12 @@ def _parts_for_gemini(contents: list[Part]):
 
 
 class GoogleClient:
+    provider = "google"
+
     def __init__(self, api_key: str, model: str):
         self.api_key, self.model = api_key, model
 
-    async def complete_structured(self, schema: dict, contents: list[Part]) -> dict:
+    async def complete_structured(self, schema: dict, contents: list[Part]) -> tuple[dict, Usage]:
         if not self.api_key:
             raise LLMError("GOOGLE_API_KEY is empty — add it to api/.env")
         # Imported here so the app never boots (or tests never run) on this import.
@@ -91,9 +106,14 @@ class GoogleClient:
         except Exception as exc:
             raise LLMError(f"Gemini call failed: {exc}") from exc
         try:
-            return json.loads(response.text)
+            raw = json.loads(response.text)
         except (TypeError, ValueError) as exc:
             raise LLMError(f"Gemini returned non-JSON output: {response.text!r}") from exc
+        meta = getattr(response, "usage_metadata", None)
+        return raw, Usage(
+            getattr(meta, "prompt_token_count", None),
+            getattr(meta, "candidates_token_count", None),
+        )
 
 
 def _openrouter_part(c: Part) -> dict:
@@ -109,11 +129,12 @@ def _openrouter_part(c: Part) -> dict:
 
 class OpenRouterClient:
     URL = "https://openrouter.ai/api/v1/chat/completions"
+    provider = "openrouter"
 
     def __init__(self, api_key: str, model: str):
         self.api_key, self.model = api_key, model
 
-    async def complete_structured(self, schema: dict, contents: list[Part]) -> dict:
+    async def complete_structured(self, schema: dict, contents: list[Part]) -> tuple[dict, Usage]:
         if not self.api_key:
             raise LLMError("OPENROUTER_API_KEY is empty — add it to api/.env")
         content = [_openrouter_part(c) for c in contents]
@@ -136,9 +157,12 @@ class OpenRouterClient:
         except httpx.HTTPError as exc:
             raise LLMError(f"OpenRouter call failed: {exc}") from exc
         try:
-            return json.loads(body["choices"][0]["message"]["content"])
+            raw = json.loads(body["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError(f"OpenRouter returned malformed output: {body!r}") from exc
+        used = body.get("usage") or {}
+        toks = Usage(used.get("prompt_tokens"), used.get("completion_tokens"))
+        return raw, toks
 
 
 async def current_llm(db: AsyncSession, settings: Settings) -> tuple[str, str]:
@@ -357,3 +381,76 @@ async def list_llm_models(
     if needle := q.strip().lower():
         models = [m for m in models if needle in m["id"].lower() or needle in m["name"].lower()]
     return models[:20]
+
+
+# --- usage log: the ironic cost of our readings ---
+
+
+async def _prices(provider: str, settings: Settings) -> dict[str, tuple[float | None, float | None]]:
+    """model id → (in, out) USD per-M tokens, from the cached catalogs."""
+    try:
+        if provider == "openrouter":
+            return {m["id"]: (m["input_cost"], m["output_cost"]) for m in await _openrouter_models()}
+        if provider == "google":
+            return await _openrouter_price_map()  # nearest fetchable number for google models
+    except LLMError:
+        pass
+    return {}
+
+
+async def usage_cost(provider: str, model: str, usage: Usage, settings: Settings) -> Decimal | None:
+    """USD for one call at write-time prices; None when tokens or prices are unknown."""
+    if usage.input_tokens is None and usage.output_tokens is None:
+        return None
+    in_price, out_price = (await _prices(provider, settings)).get(model, (None, None))
+    if in_price is None or out_price is None:
+        return None
+    try:
+        cost = (
+            Decimal(usage.input_tokens or 0) * Decimal(str(in_price))
+            + Decimal(usage.output_tokens or 0) * Decimal(str(out_price))
+        ) / Decimal(1_000_000)
+    except DecimalException:
+        return None
+    return cost.quantize(Decimal("0.000001"))
+
+
+class UsageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    provider: str
+    model: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: Decimal | None
+    draft_id: int | None
+    created_at: datetime
+
+
+class UsagePage(BaseModel):
+    totals: dict  # {calls, input_tokens, output_tokens, cost_usd}
+    recent: list[UsageOut]
+
+
+@router.get("/llm/usage", response_model=UsagePage)
+async def read_llm_usage(db: AsyncSession = Depends(get_db)):
+    calls, in_toks, out_toks, cost = (await db.execute(
+        select(
+            func.count(LLMUsage.id),
+            func.sum(LLMUsage.input_tokens),
+            func.sum(LLMUsage.output_tokens),
+            func.sum(LLMUsage.cost_usd),
+        )
+    )).one()
+    recent = (await db.scalars(
+        select(LLMUsage).order_by(LLMUsage.id.desc()).limit(50)
+    )).all()
+    return UsagePage(
+        totals={
+            "calls": calls,
+            "input_tokens": in_toks,
+            "output_tokens": out_toks,
+            "cost_usd": cost,
+        },
+        recent=recent,
+    )

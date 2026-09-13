@@ -1,26 +1,29 @@
 """V5 photo drafts: upload → LLM extraction → reviewable rows → approve/discard.
 
+Extraction runs in a task detached from the request: leaving the page mid-read
+surfaces as a "processing" draft in the list, never as a lost request.
 `create_draft_from_content` is the shared pipeline — V6's email pipeline calls it
 with a str payload instead of image bytes. Endpoints stay thin.
 """
 
+import asyncio
 import uuid
 from datetime import date, datetime
 from decimal import Decimal, DecimalException
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth import get_app_settings, get_current_user
 from app.config import Settings
 from app.db import get_db
 from app.ledger import TxnIn, TxnOut, TxnPatch, _check_refs
-from app.llm import LLMClient, LLMError, get_llm, rows_schema
-from app.models import Category, Draft, Transaction, Upload, User
+from app.llm import LLMClient, LLMError, get_llm, rows_schema, usage_cost
+from app.models import Category, Draft, LLMUsage, Transaction, Upload, User
 
 router = APIRouter(tags=["drafts"], dependencies=[Depends(get_current_user)])
 
@@ -48,6 +51,7 @@ class DraftOut(BaseModel):
     id: int
     source: str
     status: str
+    error: str | None = None
     upload_id: uuid.UUID | None
     created_at: datetime
     rows: list[TxnOut]
@@ -88,18 +92,21 @@ def _rows_from_llm(raw, cat_ids: dict[str, int], misc_id: int) -> list[dict]:
 
 async def create_draft_from_content(
     db: AsyncSession,
-    user: User,
+    user_id: uuid.UUID,
     llm: LLMClient,
+    settings: Settings,
     source: str,
     payload: str | tuple[bytes, str],
     *,
+    draft: Draft | None = None,
     upload_id: uuid.UUID | None = None,
     email_meta: dict | None = None,
 ) -> Draft:
-    """Extract rows from image bytes or (V6) email text and persist an open draft.
+    """Extract rows from image bytes or (V6) email text and fill a draft.
 
-    One LLM call → validated rows → draft + transactions with is_draft=true.
-    Raises LLMError before anything is written if the model output is unusable.
+    One LLM call → validated rows → draft (status open) + transactions with
+    is_draft=true + an llm_usage row. Raises LLMError before anything is written
+    if the model output is unusable — the caller decides what that means.
     """
     prompt = EXTRACT_PROMPTS.get(source)
     if prompt is None:
@@ -107,21 +114,72 @@ async def create_draft_from_content(
     categories = (await db.scalars(select(Category).order_by(Category.sort_order))).all()
     cat_ids = {c.name.lower(): c.id for c in categories}
 
-    raw = await llm.complete_structured(
+    raw, usage = await llm.complete_structured(
         rows_schema([c.name for c in categories]), [prompt, payload]
     )
     rows = _rows_from_llm(raw, cat_ids, cat_ids["misc"])
 
-    draft = Draft(source=source, upload_id=upload_id, email_meta=email_meta, raw_llm_output=raw)
-    db.add(draft)
+    draft = draft or Draft(source=source, upload_id=upload_id, email_meta=email_meta)
+    draft.raw_llm_output = raw
+    draft.status = "open"
+    draft.error = None
+    if draft not in db:
+        db.add(draft)
     await db.flush()  # draft.id for the row FK
     db.add_all(
-        Transaction(user_id=user.id, is_draft=True, source=source, draft_id=draft.id, **r)
+        Transaction(user_id=user_id, is_draft=True, source=source, draft_id=draft.id, **r)
         for r in rows
     )
+    db.add(LLMUsage(
+        provider=llm.provider, model=llm.model,
+        input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+        cost_usd=await usage_cost(llm.provider, llm.model, usage, settings),
+        draft_id=draft.id,
+    ))
     await db.commit()
     await db.refresh(draft, ["rows"])  # the collection isn't loaded on a brand-new draft
     return draft
+
+
+# --- detached extraction: the draft is visible as "processing" while this runs ---
+
+
+_background: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    """Fire-and-forget task, pinned so the loop can't GC it mid-flight."""
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+def get_db_factory(request: Request) -> async_sessionmaker:
+    """The session factory detached work must use (overridden in tests)."""
+    return request.app.state.db_factory
+
+
+async def _run_extraction(
+    draft_id: int,
+    user_id: uuid.UUID,
+    llm: LLMClient,
+    source: str,
+    payload: str | tuple[bytes, str],
+    db_factory: async_sessionmaker,
+    settings: Settings,
+) -> None:
+    """Fill a processing draft. Any failure lands in draft.error — nothing is lost."""
+    try:
+        async with db_factory() as db:
+            draft = await db.get(Draft, draft_id)
+            await create_draft_from_content(
+                db, user_id, llm, settings, source, payload, draft=draft
+            )
+    except Exception as exc:  # LLMError, storage hiccups, cancelled uploads — everything
+        async with db_factory() as db:
+            if (draft := await db.get(Draft, draft_id)) is not None:
+                draft.status, draft.error = "error", str(exc)[:500]
+                await db.commit()
 
 
 async def _draft_or_404(db: AsyncSession, draft_id: int) -> Draft:
@@ -206,24 +264,37 @@ async def create_draft_from_upload(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     llm: LLMClient = Depends(get_llm),
+    db_factory: async_sessionmaker = Depends(get_db_factory),
 ):
+    """Store the image bytes in the draft now, extract in the background.
+
+    Returns a processing draft immediately — navigating away can't lose it.
+    """
     upload = await db.get(Upload, body.upload_id)
     if upload is None:
         raise HTTPException(status_code=404, detail="Not found")
     if not (path := _upload_file(settings, upload)) or not path.exists():
         raise HTTPException(status_code=410, detail="Uploaded file is gone")
-    try:
-        return await create_draft_from_content(
-            db, user, llm, "photo", (path.read_bytes(), upload.mime_type), upload_id=upload.id
-        )
-    except LLMError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from None
+    draft = Draft(source="photo", upload_id=upload.id, status="processing")
+    db.add(draft)
+    await db.commit()
+    await db.refresh(draft, ["rows"])  # empty collection for DraftOut
+    _spawn(_run_extraction(
+        draft.id, user.id, llm, "photo", (path.read_bytes(), upload.mime_type),
+        db_factory, settings,
+    ))
+    return draft
 
 
 @router.get("/drafts", response_model=list[DraftOut])
 async def list_drafts(db: AsyncSession = Depends(get_db)):
+    """Open drafts plus the ones still reading / freshly failed, for the list UI."""
     return (
-        await db.scalars(select(Draft).where(Draft.status == "open").order_by(Draft.id.desc()))
+        await db.scalars(
+            select(Draft)
+            .where(Draft.status.in_(("processing", "open", "error")))
+            .order_by(Draft.id.desc())
+        )
     ).all()
 
 
@@ -331,7 +402,8 @@ async def discard_draft(
     settings: Settings = Depends(get_app_settings),
 ):
     draft = await _draft_or_404(db, draft_id)
-    _check_open(draft)
+    if draft.status not in ("open", "error"):  # a failed read is discarding-able too
+        raise HTTPException(status_code=409, detail=f"Draft is {draft.status}")
     await db.execute(delete(Transaction).where(Transaction.draft_id == draft.id))
     draft.status = "rejected"  # draft + upload rows kept; only the file and its rows go
     _delete_upload_file(settings, draft.upload)

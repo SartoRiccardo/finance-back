@@ -1,5 +1,6 @@
 """V5 photo drafts. The LLM dependency is always faked — no model calls in CI."""
 
+import asyncio
 import base64
 import uuid
 from decimal import Decimal
@@ -7,7 +8,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from app.llm import LLMError, get_llm
+from app.llm import LLMError, Usage, get_llm
 from app.models import Draft, Transaction, Upload
 
 # 1x1 transparent png
@@ -26,15 +27,19 @@ GOOD_ROWS = {
 class FakeLLM:
     """Stands in for both real clients."""
 
-    def __init__(self, payload=None, error=None):
-        self.payload, self.error = payload, error
+    def __init__(self, payload=None, error=None, delay=0, usage=None):
+        self.provider, self.model = "google", "fake-model"
+        self.payload, self.error, self.delay = payload, error, delay
+        self.usage = usage or Usage()
         self.calls = []
 
     async def complete_structured(self, schema, contents):
         self.calls.append((schema, contents))
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.error:
             raise LLMError(self.error)
-        return self.payload
+        return self.payload, self.usage
 
 
 def use_llm(client, fake):
@@ -45,7 +50,7 @@ def use_llm(client, fake):
 
 @pytest.fixture
 def upload_dir(tmp_path):
-    return tmp_path
+    return tmp_path / "uploads"  # not tmp_path itself: the test DB file lives there now
 
 
 @pytest.fixture
@@ -61,12 +66,22 @@ async def upload_receipt(client, **over):
     return r.json()["upload_id"]
 
 
+async def wait_draft(client, draft_id: int) -> dict:
+    """Extraction is detached; poll until it leaves processing (1s cap)."""
+    for _ in range(200):
+        body = (await client.get(f"/api/drafts/{draft_id}")).json()
+        if body["status"] != "processing":
+            return body
+        await asyncio.sleep(0.005)
+    raise AssertionError("draft never left processing")
+
+
 async def make_draft(client, payload=GOOD_ROWS) -> dict:
     upload_id = await upload_receipt(client)
     use_llm(client, FakeLLM(payload))
     r = await client.post("/api/drafts/from-upload", json={"upload_id": upload_id})
     assert r.status_code == 201, r.text
-    return r.json()
+    return await wait_draft(client, r.json()["id"])
 
 
 async def cid(client, name: str) -> int:
@@ -171,29 +186,39 @@ async def test_open_draft_invisible_to_transactions_and_reports(dclient):
     {"rows": [{"date": "someday", "description": "x", "amount": 1, "category": "Misc"}]},
     {"rows": [{"date": "2026-09-10", "description": "x", "amount": -3, "category": "Misc"}]},
 ])
-async def test_malformed_llm_output_leaves_no_partial_draft(dclient, db, upload_dir, payload):
+async def test_malformed_llm_output_leaves_an_errored_empty_draft(dclient, db, upload_dir, payload):
     await dclient.get("/api/auth/dev-login")
     upload_id = await upload_receipt(dclient)
     use_llm(dclient, FakeLLM(payload))
     r = await dclient.post("/api/drafts/from-upload", json={"upload_id": upload_id})
-    assert r.status_code == 502, r.text
+    assert r.status_code == 201, r.text  # processing draft returned immediately
+
+    draft = await wait_draft(dclient, r.json()["id"])
+    assert draft["status"] == "error" and draft["rows"] == []
 
     async with db() as s:
         assert (await s.scalars(select(Transaction))).all() == []
-        assert (await s.scalars(select(Draft))).all() == []
+        stored = (await s.scalars(select(Draft))).one()
+        assert stored.status == "error" and stored.error
     # the image survived too — a retry doesn't need a re-upload
     assert [f.name for f in upload_dir.iterdir()] == [f"{upload_id}.png"]
 
 
 @pytest.mark.anyio
-async def test_llm_provider_error_is_a_clean_502(dclient, db):
+async def test_llm_provider_error_lands_in_the_draft(dclient, db):
     await dclient.get("/api/auth/dev-login")
     upload_id = await upload_receipt(dclient)
     use_llm(dclient, FakeLLM(error="Gemini call failed: 429"))
     r = await dclient.post("/api/drafts/from-upload", json={"upload_id": upload_id})
-    assert r.status_code == 502 and "429" in r.json()["detail"]
-    async with db() as s:
-        assert (await s.scalars(select(Draft))).all() == []
+    assert r.status_code == 201, r.text
+    draft = await wait_draft(dclient, r.json()["id"])
+    assert draft["status"] == "error" and "429" in draft["error"]
+    # still listed — a failed read is visible, not lost
+    assert [d["id"] for d in (await dclient.get("/api/drafts")).json()] == [draft["id"]]
+    # and it can be discarded to clear the list (approve stays blocked)
+    assert (await dclient.post(f"/api/drafts/{draft['id']}/approve")).status_code == 409
+    assert (await dclient.delete(f"/api/drafts/{draft['id']}")).status_code == 204
+    assert (await dclient.get("/api/drafts")).json() == []
 
 
 @pytest.mark.anyio
@@ -206,7 +231,51 @@ async def test_empty_api_key_fails_at_extraction_not_boot(make_client, upload_di
     assert (await client.get("/api/health")).json() == {"status": "ok"}
     upload_id = await upload_receipt(client)
     r = await client.post("/api/drafts/from-upload", json={"upload_id": upload_id})
-    assert r.status_code == 502 and "GOOGLE_API_KEY" in r.json()["detail"]
+    assert r.status_code == 201, r.text
+    draft = await wait_draft(client, r.json()["id"])
+    assert draft["status"] == "error" and "GOOGLE_API_KEY" in draft["error"]
+
+
+@pytest.mark.anyio
+async def test_processing_draft_is_listed_and_not_approvable(dclient):
+    await dclient.get("/api/auth/dev-login")
+    upload_id = await upload_receipt(dclient)
+    use_llm(dclient, FakeLLM(GOOD_ROWS, delay=0.3))  # long enough to catch processing
+    r = await dclient.post("/api/drafts/from-upload", json={"upload_id": upload_id})
+    assert r.status_code == 201 and r.json()["status"] == "processing" and r.json()["rows"] == []
+    draft_id = r.json()["id"]
+
+    listing = (await dclient.get("/api/drafts")).json()
+    assert [d["id"] for d in listing] == [draft_id]
+    assert listing[0]["status"] == "processing"
+
+    assert (await dclient.post(f"/api/drafts/{draft_id}/approve")).status_code == 409
+
+    body = await wait_draft(dclient, draft_id)
+    assert body["status"] == "open" and len(body["rows"]) == 2
+
+
+@pytest.mark.anyio
+async def test_usage_recorded_with_cost(dclient, monkeypatch):
+    """The extraction logs an llm_usage row; the picker's prices price it."""
+    await dclient.get("/api/auth/dev-login")
+
+    async def fake_prices():
+        return {"fake-model": (0.3, 2.5)}
+
+    monkeypatch.setattr("app.llm._openrouter_price_map", fake_prices)
+    upload_id = await upload_receipt(dclient)
+    use_llm(dclient, FakeLLM(GOOD_ROWS, usage=Usage(input_tokens=100, output_tokens=50)))
+    r = await dclient.post("/api/drafts/from-upload", json={"upload_id": upload_id})
+    draft = await wait_draft(dclient, r.json()["id"])
+
+    page = (await dclient.get("/api/llm/usage")).json()
+    assert page["totals"]["calls"] == 1
+    assert page["totals"]["input_tokens"] == 100 and page["totals"]["output_tokens"] == 50
+    # (100 in × $0.3 + 50 out × $2.5) / 1M
+    assert float(page["totals"]["cost_usd"]) == pytest.approx(0.000155, abs=1e-9)
+    row = page["recent"][0]
+    assert (row["provider"], row["model"], row["draft_id"]) == ("google", "fake-model", draft["id"])
 
 
 @pytest.mark.anyio

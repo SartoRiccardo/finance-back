@@ -4,6 +4,7 @@ Both upstreams are faked — google-genai via a fake module in sys.modules,
 OpenRouter via respx. No real API calls in CI.
 """
 
+import asyncio
 import base64
 import sys
 import types
@@ -13,7 +14,7 @@ import respx
 from httpx import Response
 from sqlalchemy import select
 
-from app.llm import _catalog_cache
+from app.llm import Usage, _catalog_cache
 from app.models import AppSetting
 
 PNG = base64.b64decode(
@@ -267,11 +268,14 @@ async def test_extraction_uses_provider_and_model_from_settings(dclient, db, mon
     seen = []
 
     class RecordingClient:
+        provider = "openrouter"
+
         def __init__(self, api_key, model):
             seen.append((api_key, model))
+            self.model = model
 
         async def complete_structured(self, schema, contents):
-            return ROWS
+            return ROWS, Usage()
 
     monkeypatch.setattr("app.llm.OpenRouterClient", RecordingClient)
 
@@ -281,7 +285,13 @@ async def test_extraction_uses_provider_and_model_from_settings(dclient, db, mon
     assert r.status_code == 201, r.text
     r = await dclient.post("/api/drafts/from-upload", json={"upload_id": r.json()["upload_id"]})
     assert r.status_code == 201, r.text
-    assert [row["description"] for row in r.json()["rows"]] == ["Coop run"]
+    # extraction is detached — wait for it to land
+    for _ in range(200):
+        draft = (await dclient.get(f"/api/drafts/{r.json()['id']}")).json()
+        if draft["status"] != "processing":
+            break
+        await asyncio.sleep(0.005)
+    assert [row["description"] for row in draft["rows"]] == ["Coop run"]
     # the fake got exactly one call; the model is the one PUT wrote (key comes from env —
     # not asserted, it may be the developer's real one)
     assert len(seen) == 1 and seen[0][1] == "qwen/qwen3-vl-235b"

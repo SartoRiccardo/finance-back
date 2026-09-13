@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from app.auth import register_dev_login, router as auth_router
 from app.config import Settings, get_settings
+from app.db import SessionLocal
 from app.drafts import router as drafts_router
 from app.ledger import router as ledger_router
 from app.llm import ensure_app_settings, router as llm_router
@@ -35,6 +36,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Personal Finance API", lifespan=lifespan)
     app.state.settings = settings
+    app.state.db_factory = SessionLocal  # detached work (draft extraction) uses this
 
     @app.get("/api/health")
     async def health():
