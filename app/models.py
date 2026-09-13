@@ -13,6 +13,7 @@ from sqlalchemy import (
     Uuid,
     func,
     insert,
+    inspect,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -129,21 +130,36 @@ LABEL_COLORS = {
 
 
 def seed(bind) -> None:
-    """Insert seed rows. bind is a Connection (migrations) or Session (tests)."""
+    """Insert seed rows. bind is a Connection (migrations) or Session (tests).
+
+    Columns the physical table doesn't have yet are skipped — migration 0002
+    seeds before 0003 adds `color`; 0003 backfills it afterwards.
+    """
+
+    def rows(table, data):
+        cols = {c["name"] for c in inspect(bind).get_columns(table)}
+        return [{k: v for k, v in row.items() if k in cols} for row in data]
+
     bind.execute(
         insert(Category),
-        [
-            {
-                "name": n,
-                "description": d,
-                "is_investment": inv,
-                "sort_order": i,
-                "color": CATEGORY_COLORS.get(n),
-            }
-            for i, (n, d, inv) in enumerate(SEED_CATEGORIES)
-        ],
+        rows(
+            "categories",
+            [
+                {
+                    "name": n,
+                    "description": d,
+                    "is_investment": inv,
+                    "sort_order": i,
+                    "color": CATEGORY_COLORS.get(n),
+                }
+                for i, (n, d, inv) in enumerate(SEED_CATEGORIES)
+            ],
+        ),
     )
     bind.execute(
         insert(Label),
-        [{"name": n, "is_spending": False, "color": LABEL_COLORS.get(n)} for n in SEED_LABELS],
+        rows(
+            "labels",
+            [{"name": n, "is_spending": False, "color": LABEL_COLORS.get(n)} for n in SEED_LABELS],
+        ),
     )
