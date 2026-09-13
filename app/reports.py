@@ -97,6 +97,69 @@ async def yearly(db: AsyncSession, user_id, year: int) -> dict:
     return {"year": year, "months": months, "totals": totals_of(months)}
 
 
+async def by_category(
+    db: AsyncSession, user_id, date_from: datetime.date, date_to: datetime.date
+) -> list[dict]:
+    """Spend per category over a range (inclusive), biggest first.
+
+    Spends only (earn rows have no category); investment categories included,
+    flagged via is_investment.
+    """
+    rows = await db.execute(
+        select(
+            Category.id,
+            Category.name,
+            Category.is_investment,
+            func.sum(Transaction.amount).label("total"),
+        )
+        .join(Category, Transaction.category_id == Category.id)
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.is_draft.is_(False),
+            Transaction.direction == "spend",
+            Transaction.date >= date_from,
+            Transaction.date <= date_to,
+        )
+        .group_by(Category.id, Category.name, Category.is_investment)
+        .order_by(func.sum(Transaction.amount).desc(), Category.name)
+    )
+    return [
+        {"category_id": r.id, "name": r.name, "is_investment": bool(r.is_investment),
+         "total": Decimal(str(r.total))}
+        for r in rows
+    ]
+
+
+async def category_series(db: AsyncSession, user_id, year: int) -> list[dict]:
+    """Spend per category for one year: months is Jan..Dec, zero-filled."""
+    rows = await db.execute(
+        select(
+            Category.id,
+            Category.name,
+            Category.is_investment,
+            cast(extract("month", Transaction.date), Integer).label("m"),
+            func.sum(Transaction.amount).label("total"),
+        )
+        .join(Category, Transaction.category_id == Category.id)
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.is_draft.is_(False),
+            Transaction.direction == "spend",
+            Transaction.date >= datetime.date(year, 1, 1),
+            Transaction.date <= datetime.date(year, 12, 31),
+        )
+        .group_by(Category.id, Category.name, Category.is_investment, "m")
+    )
+    series: dict[int, dict] = {}
+    for r in rows:
+        s = series.setdefault(
+            r.id, {"category_id": r.id, "name": r.name, "is_investment": bool(r.is_investment),
+                   "months": [ZERO] * 12}
+        )
+        s["months"][int(r.m) - 1] += Decimal(str(r.total))
+    return [series[k] for k in sorted(series)]
+
+
 # --- endpoints ---
 
 
@@ -122,3 +185,24 @@ async def summary_report(
     if date_from > date_to:
         raise HTTPException(status_code=422, detail="from must be <= to")
     return await range_sums(db, user.id, date_from, date_to)
+
+
+@router.get("/by-category")
+async def by_category_report(
+    date_from: datetime.date = Query(alias="from"),
+    date_to: datetime.date = Query(alias="to"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if date_from > date_to:
+        raise HTTPException(status_code=422, detail="from must be <= to")
+    return await by_category(db, user.id, date_from, date_to)
+
+
+@router.get("/category-series")
+async def category_series_report(
+    year: int | None = Query(None, ge=1900, le=2100),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await category_series(db, user.id, year or datetime.date.today().year)

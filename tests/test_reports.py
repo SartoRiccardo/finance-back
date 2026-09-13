@@ -70,7 +70,13 @@ async def seed_fixture(db) -> None:
 
 @pytest.mark.anyio
 async def test_reports_require_auth(client):
-    for path in ("/api/reports/yearly", "/api/reports/summary?from=2026-01-01&to=2026-12-31"):
+    paths = (
+        "/api/reports/yearly",
+        "/api/reports/summary?from=2026-01-01&to=2026-12-31",
+        "/api/reports/by-category?from=2026-01-01&to=2026-12-31",
+        "/api/reports/category-series?year=2026",
+    )
+    for path in paths:
         assert (await client.get(path)).status_code == 401
 
 
@@ -141,3 +147,86 @@ async def test_summary_over_partial_range(client, db):
     r = await client.get("/api/reports/summary", params={"from": f"{YEAR}-12-31", "to": f"{YEAR}-01-01"})
     assert r.status_code == 422
     assert (await client.get("/api/reports/summary", params={"to": f"{YEAR}-01-01"})).status_code == 422
+
+
+# --- V4 insights: by-category + category-series ---
+
+# (date, category, amount, is_draft) — the last row must be invisible to both endpoints
+V4_SPENDS = [
+    ("2025-12-31", "Misc", "77.77", False),  # year boundary: belongs to 2025 only
+    ("2026-01-05", "Misc", "120.50", False),
+    ("2026-01-20", "Misc", "30.25", False),
+    ("2026-01-20", "Takeout", "55.00", False),
+    ("2026-01-20", "Investment", "200.00", False),
+    ("2026-02-10", "Misc", "10.00", False),
+    ("2026-03-01", "Misc", "999.99", True),  # draft
+]
+
+
+async def seed_v4(db) -> None:
+    async with db() as s:
+        cats = {c.name: c.id for c in (await s.scalars(select(Category)))}
+        user_id = (await s.scalars(select(User))).one().id
+        for day, cat, amount, draft in V4_SPENDS:
+            s.add(Transaction(
+                user_id=user_id, date=datetime.date.fromisoformat(day),
+                description=f"{cat} spend", amount=Decimal(amount),
+                direction="spend", category_id=cats[cat], is_draft=draft,
+            ))
+        await s.commit()
+
+
+def spent(row: dict) -> list[Decimal]:
+    return [Decimal(str(v)) for v in row["months"]]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("db", ["postgres"], indirect=True)  # exact-cent Numeric math
+async def test_by_category_orders_spends_and_skips_drafts(client, db):
+    await client.get("/api/auth/dev-login")
+    await seed_v4(db)
+
+    data = (await client.get(
+        "/api/reports/by-category", params={"from": "2026-01-01", "to": "2026-02-28"}
+    )).json()
+    assert [(r["name"], r["is_investment"], Decimal(str(r["total"]))) for r in data] == [
+        ("Investment", True, Decimal("200.00")),
+        ("Misc", False, Decimal("160.75")),  # two txns summed
+        ("Takeout", False, Decimal("55.00")),
+    ]
+    assert all(isinstance(r["category_id"], int) for r in data)
+
+    # the 2025 row and the draft row are out of range/invisible; earns have no category
+    empty = (await client.get(
+        "/api/reports/by-category", params={"from": "2026-03-01", "to": "2026-03-31"}
+    )).json()
+    assert empty == []  # only the draft lives in March
+
+    r = await client.get("/api/reports/by-category", params={"from": "2026-02-28", "to": "2026-01-01"})
+    assert r.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("db", ["postgres"], indirect=True)  # exact-cent Numeric math
+async def test_category_series_zero_fills_twelve_months(client, db):
+    await client.get("/api/auth/dev-login")
+    await seed_v4(db)
+
+    data = (await client.get("/api/reports/category-series", params={"year": 2026})).json()
+    assert {r["name"] for r in data} == {"Misc", "Takeout", "Investment"}
+    by_name = {r["name"]: r for r in data}
+    assert all(r["is_investment"] == (r["name"] == "Investment") for r in data)
+    for row in data:
+        assert len(row["months"]) == 12
+    assert spent(by_name["Misc"]) == [Decimal("150.75"), Decimal("10.00"), *([Decimal(0)] * 10)]
+    assert spent(by_name["Takeout"]) == [Decimal("55.00"), *([Decimal(0)] * 11)]
+    assert spent(by_name["Investment"]) == [Decimal("200.00"), *([Decimal(0)] * 11)]  # draft row not added
+
+    # year boundary: the 2025-12-31 spend shows up in 2025's December, not 2026's January
+    prev = (await client.get("/api/reports/category-series", params={"year": 2025})).json()
+    prev_misc = next(r for r in prev if r["name"] == "Misc")
+    assert spent(prev_misc) == [Decimal(0)] * 11 + [Decimal("77.77")]
+
+    # empty year: categories may vanish entirely rather than show all-zero rows
+    assert (await client.get("/api/reports/category-series", params={"year": 2024})).json() == []
+    assert (await client.get("/api/reports/category-series", params={"year": 1800})).status_code == 422
