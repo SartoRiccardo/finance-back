@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:5173"
     env: str = "local"
     dev_auth_bypass: bool = False
+    # V5 photo drafts — empty keys are fine at boot; a missing key fails only at extraction.
+    llm_provider: str = "google"
+    llm_model: str = "gemini-2.5-flash"
+    google_api_key: str = ""
+    openrouter_api_key: str = ""
+    upload_dir: str = "data/uploads"
 
     @property
     def dev_auth_enabled(self) -> bool:

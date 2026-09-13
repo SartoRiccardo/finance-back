@@ -3,6 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     Date,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     insert,
     inspect,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -84,11 +86,50 @@ class Transaction(TimestampMixin, Base):
     label_id: Mapped[int | None] = mapped_column(ForeignKey("labels.id"))
     # Draft columns are filled by later sprints (V5/V6); unused until then.
     is_draft: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-    draft_id: Mapped[int | None] = mapped_column(ForeignKey("transactions.id"))
+    draft_id: Mapped[int | None] = mapped_column(ForeignKey("drafts.id"))
     source: Mapped[str] = mapped_column(String(8), default="manual", server_default="manual")
 
     category: Mapped[Category | None] = relationship(lazy="selectin")
     label: Mapped[Label | None] = relationship(lazy="selectin")
+
+
+# jsonb on Postgres (spec), plain JSON on the sqlite test DB.
+JsonDict = JSON().with_variant(JSONB(), "postgresql")
+
+
+class Upload(TimestampMixin, Base):
+    __tablename__ = "uploads"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    stored_path: Mapped[str] = mapped_column(String(200))
+    original_name: Mapped[str | None]
+    mime_type: Mapped[str] = mapped_column(String(100))
+    size_bytes: Mapped[int]
+
+
+class Draft(TimestampMixin, Base):
+    __tablename__ = "drafts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(8), default="photo", server_default="photo")
+    upload_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("uploads.id"))
+    # email_meta / source='email' are V6's; nullable until then.
+    email_meta: Mapped[dict | None] = mapped_column(JsonDict)
+    raw_llm_output: Mapped[dict | None] = mapped_column(JsonDict)
+    status: Mapped[str] = mapped_column(String(8), default="open", server_default="open")
+
+    upload: Mapped[Upload | None] = relationship(lazy="selectin")
+    rows: Mapped[list[Transaction]] = relationship(foreign_keys="Transaction.draft_id", lazy="selectin")
+
+
+class AppSetting(Base):
+    """Single row (id=1) holding runtime-flippable config; created from env defaults on startup."""
+
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    llm_provider: Mapped[str] = mapped_column(String(16), default="google", server_default="google")
+    llm_model: Mapped[str] = mapped_column(String(120), default="gemini-2.5-flash", server_default="gemini-2.5-flash")
 
 
 SEED_CATEGORIES = [
