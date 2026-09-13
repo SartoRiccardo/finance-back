@@ -57,9 +57,15 @@ def fake_genai_module(monkeypatch, models=None, error=None):
             return m
 
     class FakeAioModels:
+        # the real AsyncModels.list() is a coroutine resolving to the pager —
+        # mimic it, or a missing `await` in production code passes these tests
         def list(self):
             calls.append("list")
-            return FakePager()
+
+            async def _call():
+                return FakePager()
+
+            return _call()
 
     genai = types.SimpleNamespace(Client=lambda api_key: types.SimpleNamespace(
         aio=types.SimpleNamespace(models=FakeAioModels())
@@ -122,22 +128,39 @@ async def test_google_models_q_filter_normalize_cap(dclient, monkeypatch):
     models = (
         [model(f"models/gemini-flash-{i:02d}", f"Gemini Flash {i:02d}") for i in range(25)]
         + [model("models/gemini-2.5-pro", "Gemini 2.5 Pro")]
-        + [model("models/other-1")]  # no display_name → name falls back to id
+        + [model("models/gemini-shiny")]  # no display_name → name falls back to id
+        + [model("models/gemini-embedding-001", "Embeddings"),  # gemini prefix, not chat
+           model("models/gemini-2.5-flash-tts", "TTS")]  # → filtered out
     )
     calls = fake_genai_module(monkeypatch, models)
+
+    async def fake_prices():
+        return {"gemini-flash-00": (0.3, 2.5), "gemini-shiny": (None, None)}
+
+    monkeypatch.setattr("app.llm._openrouter_price_map", fake_prices)
 
     r = await dclient.get("/api/llm/models", params={"q": "FLASH"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body) == 20  # 25 matches, capped
-    assert body[0] == {"id": "gemini-flash-00", "name": "Gemini Flash 00"}
+    assert body[0] == {
+        "id": "gemini-flash-00", "name": "Gemini Flash 00",
+        "input_cost": 0.3, "output_cost": 2.5,  # joined from OpenRouter's listing
+    }
     assert all("flash" in m["id"] for m in body)
 
-    # matches on name too; no display_name falls back to the raw id
+    # matches on name too; no display_name falls back to the raw id; no price → None
     r = await dclient.get("/api/llm/models", params={"q": "2.5 pro"})
-    assert r.json() == [{"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"}]
-    r = await dclient.get("/api/llm/models", params={"q": "other"})
-    assert r.json() == [{"id": "other-1", "name": "models/other-1"}]
+    assert r.json() == [{
+        "id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "input_cost": None, "output_cost": None,
+    }]
+    r = await dclient.get("/api/llm/models", params={"q": "shiny"})
+    assert r.json() == [{"id": "gemini-shiny", "name": "models/gemini-shiny",
+                         "input_cost": None, "output_cost": None}]
+
+    # non-chat models sharing the gemini prefix (tts/embedding) never reach the picker
+    assert (await dclient.get("/api/llm/models", params={"q": "embedding"})).json() == []
+    assert (await dclient.get("/api/llm/models", params={"q": "tts"})).json() == []
 
     # one upstream fetch serves all three listings (cache)
     unfiltered = (await dclient.get("/api/llm/models")).json()
@@ -154,20 +177,32 @@ async def test_openrouter_models_q_filter(dclient):
     })
     route = respx.get("https://openrouter.ai/api/v1/models").mock(return_value=Response(200, json={
         "data": [
-            {"id": "qwen/qwen3-vl-235b", "name": "Qwen3 VL 235B"},
-            {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash"},
-            {"id": "no-name-field"},  # name falls back to id
+            {"id": "qwen/qwen3-vl-235b", "name": "Qwen3 VL 235B",
+             "architecture": {"input_modalities": ["text", "image"]},
+             "pricing": {"prompt": "0.0000002", "completion": "0.0000006"}},
+            {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash",
+             "architecture": {"input_modalities": ["text", "image"]},
+             "pricing": {"prompt": "0", "completion": "0"}},  # free variant
+            {"id": "text-only-model", "name": "Text Only",
+             "architecture": {"input_modalities": ["text"]},
+             "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+            {"id": "no-name-field",  # name falls back to id; no pricing → n/a
+             "architecture": {"input_modalities": ["text", "image"]}},
         ]
     }))
 
     r = await dclient.get("/api/llm/models", params={"q": "qwen"})
     assert r.status_code == 200, r.text
-    assert r.json() == [{"id": "qwen/qwen3-vl-235b", "name": "Qwen3 VL 235B"}]
+    assert r.json() == [{"id": "qwen/qwen3-vl-235b", "name": "Qwen3 VL 235B",
+                         "input_cost": 0.2, "output_cost": 0.6}]
     assert route.call_count == 1  # cached across the unfiltered retry below
     assert (await dclient.get("/api/llm/models")).json() == [
-        {"id": "qwen/qwen3-vl-235b", "name": "Qwen3 VL 235B"},
-        {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash"},
-        {"id": "no-name-field", "name": "no-name-field"},
+        {"id": "qwen/qwen3-vl-235b", "name": "Qwen3 VL 235B",
+         "input_cost": 0.2, "output_cost": 0.6},
+        {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash",
+         "input_cost": 0.0, "output_cost": 0.0},
+        {"id": "no-name-field", "name": "no-name-field",
+         "input_cost": None, "output_cost": None},
     ]
     assert route.call_count == 1
 

@@ -95,6 +95,17 @@ class GoogleClient:
             raise LLMError(f"Gemini returned non-JSON output: {response.text!r}") from exc
 
 
+def _openrouter_part(c: Part) -> dict:
+    """One chat-completions content part: text, or a tuple as a base64 data URL."""
+    if isinstance(c, str):
+        return {"type": "text", "text": c}
+    data, mime = c
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"},
+    }
+
+
 class OpenRouterClient:
     URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -104,12 +115,7 @@ class OpenRouterClient:
     async def complete_structured(self, schema: dict, contents: list[Part]) -> dict:
         if not self.api_key:
             raise LLMError("OPENROUTER_API_KEY is empty — add it to api/.env")
-        content = [
-            {"type": "image_url",
-             "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}}
-            if isinstance(c, tuple) else {"type": "text", "text": c}
-            for c in contents
-        ]
+        content = [_openrouter_part(c) for c in contents]
         try:
             async with httpx.AsyncClient(timeout=120) as http:
                 resp = await http.post(
@@ -209,15 +215,12 @@ CATALOG_TTL = 300  # seconds
 _catalog_cache: dict[str, tuple[float, list[dict]]] = {}
 
 
-async def _google_models(api_key: str) -> list[dict]:
-    from google import genai  # lazy, same reason as the extraction client
-
-    client = genai.Client(api_key=api_key)
+def _per_million(price) -> float | None:
+    """OpenRouter prices are per-token USD strings; the picker reads better per million."""
     try:
-        page = [m async for m in client.aio.models.list()]
-    except Exception as exc:  # anything from the SDK → one clean failure shape
-        raise LLMError(f"Gemini model list failed: {exc}") from exc
-    return [{"id": m.name.removeprefix("models/"), "name": m.display_name or m.name} for m in page]
+        return round(float(price) * 1_000_000, 4)
+    except (TypeError, ValueError):
+        return None
 
 
 async def _openrouter_models() -> list[dict]:
@@ -225,9 +228,61 @@ async def _openrouter_models() -> list[dict]:
         async with httpx.AsyncClient(timeout=30) as http:
             resp = await http.get("https://openrouter.ai/api/v1/models")
             resp.raise_for_status()
-            return [{"id": m["id"], "name": m.get("name") or m["id"]} for m in resp.json()["data"]]
+            data = resp.json()["data"]
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
         raise LLMError(f"OpenRouter model list failed: {exc}") from exc
+    out = []
+    for m in data:
+        if not {"text", "image"} <= set((m.get("architecture") or {}).get("input_modalities") or []):
+            continue  # picker is for receipt vision models only
+        price = m.get("pricing") or {}
+        out.append({
+            "id": m["id"],
+            "name": m.get("name") or m["id"],
+            "input_cost": _per_million(price.get("prompt")),
+            "output_cost": _per_million(price.get("completion")),
+        })
+    return out
+
+
+async def _openrouter_price_map() -> dict[str, tuple[float | None, float | None]]:
+    """Google model id → (in, out) per-M USD, via OpenRouter's listing of the same model.
+
+    Google's ListModels carries no pricing, so this is the nearest fetchable number
+    (OpenRouter may add a small cut vs Google's own price). Missing id → None → "n/a".
+    """
+    try:
+        return {m["id"].removeprefix("google/"): (m["input_cost"], m["output_cost"])
+                for m in await _openrouter_models()}
+    except LLMError:
+        return {}  # OpenRouter down → the google listing still works, costs just show n/a
+
+
+async def _google_models(api_key: str) -> list[dict]:
+    from google import genai  # lazy, same reason as the extraction client
+
+    client = genai.Client(api_key=api_key)
+    try:
+        pager = await client.aio.models.list()  # coroutine → AsyncPager
+        page = [m async for m in pager]
+    except Exception as exc:  # anything from the SDK → one clean failure shape
+        raise LLMError(f"Gemini model list failed: {exc}") from exc
+    prices = await _openrouter_price_map()
+    out = []
+    for m in page:
+        gid = m.name.removeprefix("models/")
+        # ListModels has no modality info; gemini-* chat models are text+image input,
+        # minus the tts/embedding variants that share the gemini prefix.
+        if "gemini" not in gid or "tts" in gid or "embedding" in gid:
+            continue
+        in_cost, out_cost = prices.get(gid, (None, None))
+        out.append({
+            "id": gid,
+            "name": m.display_name or m.name,
+            "input_cost": in_cost,
+            "output_cost": out_cost,
+        })
+    return out
 
 
 async def _catalog(provider: str, settings: Settings) -> list[dict]:
