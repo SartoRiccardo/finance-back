@@ -37,7 +37,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(auth_router, prefix="/api")
     if settings.dev_auth_enabled:
-        register_dev_login(app)
+        register_dev_login(app, settings)
 
     return app
 

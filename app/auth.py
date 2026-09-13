@@ -182,7 +182,7 @@ async def me(user: User = Depends(get_current_user)):
     }
 
 
-def register_dev_login(app) -> None:
+def register_dev_login(app, settings: Settings) -> None:
     """Called only when settings.dev_auth_enabled — disabled means the route is never registered (404)."""
 
     r = APIRouter(prefix="/auth", tags=["auth"])
