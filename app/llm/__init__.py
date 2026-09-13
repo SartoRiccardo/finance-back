@@ -7,6 +7,7 @@ provider itself except to list models.
 
 import base64
 import json
+import re
 import time
 from typing import Literal, Protocol
 
@@ -241,6 +242,8 @@ async def _openrouter_models() -> list[dict]:
             "name": m.get("name") or m["id"],
             "input_cost": _per_million(price.get("prompt")),
             "output_cost": _per_million(price.get("completion")),
+            # internal: joins the model to its intelligence benchmark (popped before return)
+            "slug": m.get("canonical_slug") or m["id"],
         })
     return out
 
@@ -256,6 +259,39 @@ async def _openrouter_price_map() -> dict[str, tuple[float | None, float | None]
                 for m in await _openrouter_models()}
     except LLMError:
         return {}  # OpenRouter down → the google listing still works, costs just show n/a
+
+
+def _base_slug(slug: str) -> str:
+    """Collapse slug spellings to the model line: pinned versions, variants, aliases."""
+    slug = slug.strip("~")  # provider aliases like ~z-ai/glm-flash-latest
+    slug = slug.split(":")[0]  # :free/:batch variants
+    return re.sub(r"-\d{8}$", "", slug)  # canonical slugs are date-pinned
+
+
+async def _intelligence_index(api_key: str) -> dict[str, float]:
+    """Base model slug → Artificial Analysis intelligence index, for ranking the picker.
+
+    Benchmarks key on `model_permaslug` (date-pinned) while the catalog carries
+    unpinned ids — both sides go through _base_slug to meet in the middle. Needs an
+    OpenRouter key and is rate-limited hard, so it's only fetched inside the cached
+    catalog path. Any failure → {} → catalog order (newest first).
+    """
+    if not api_key:
+        return {}
+    url = "https://openrouter.ai/api/v1/benchmarks?source=artificial-analysis&task_type=intelligence"
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.get(url, headers={"Authorization": f"Bearer {api_key}"})
+            resp.raise_for_status()
+            index: dict[str, float] = {}
+            for m in resp.json()["data"]:
+                if m.get("model_permaslug") and m.get("intelligence_index") is not None:
+                    key = _base_slug(m["model_permaslug"])
+                    # several pinned versions of one line may be listed — keep the best
+                    index[key] = max(index.get(key, -1), m["intelligence_index"])
+            return index
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
+        return {}
 
 
 async def _google_models(api_key: str) -> list[dict]:
@@ -294,6 +330,12 @@ async def _catalog(provider: str, settings: Settings) -> list[dict]:
         models = await _google_models(settings.google_api_key)
     elif provider == "openrouter":
         models = await _openrouter_models()
+        index = await _intelligence_index(settings.openrouter_api_key)
+        # smartest first; variants/aliases/pinned versions meet in _base_slug,
+        # unranked models keep catalog order at the end (stable sort)
+        models.sort(key=lambda m: index.get(_base_slug(m["slug"]), -1), reverse=True)
+        for m in models:
+            m.pop("slug", None)  # internal join key — not part of the response contract
     else:
         raise LLMError(f"Unknown LLM provider {provider!r}")
     _catalog_cache[provider] = (time.monotonic(), models)

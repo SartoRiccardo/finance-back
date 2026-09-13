@@ -24,6 +24,9 @@ TEST_SETTINGS = {
     "frontend_url": "http://front.test",
     "env": "local",
     "dev_auth_bypass": True,
+    # empty so the suite stays hermetic even with real keys in the developer's .env
+    "google_api_key": "",
+    "openrouter_api_key": "",
 }
 
 # Dedicated scratch database on the dev Postgres server; never touches the dev `pf` DB.

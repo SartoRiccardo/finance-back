@@ -209,6 +209,39 @@ async def test_openrouter_models_q_filter(dclient):
 
 @pytest.mark.anyio
 @respx.mock
+async def test_openrouter_models_sorted_by_intelligence(make_client):
+    """Smartest first; variants/aliases/pinned versions inherit the line's rank; unranked last."""
+    dclient = make_client(openrouter_api_key="test-key")
+    await dclient.get("/api/auth/dev-login")
+    vision = {"architecture": {"input_modalities": ["text", "image"]}}
+    respx.get("https://openrouter.ai/api/v1/models").mock(return_value=Response(200, json={
+        "data": [
+            {"id": "a/glm-5:free", "name": "GLM 5 (free)", "canonical_slug": "a/glm-5-20260901", **vision},
+            {"id": "b/small", "name": "Small", "canonical_slug": "b/small-20260801", **vision},
+            {"id": "~a/glm-5", "name": "GLM 5", "canonical_slug": "a/glm-5-20260915", **vision},
+            {"id": "c/unranked", "name": "Unranked", **vision},  # no canonical_slug
+        ]
+    }))
+    benchmarks = respx.get("https://openrouter.ai/api/v1/benchmarks").mock(
+        return_value=Response(200, json={"data": [
+            {"model_permaslug": "b/small-20260801", "intelligence_index": 50},
+            {"model_permaslug": "a/glm-5-20260901", "intelligence_index": 40},
+            {"model_permaslug": "a/glm-5-20260915", "intelligence_index": 45},
+        ]})
+    )
+
+    await dclient.put("/api/settings", json={"llm_provider": "openrouter", "llm_model": "a/glm-5"})
+    r = await dclient.get("/api/llm/models")
+    assert r.status_code == 200, r.text
+    # newest pinned glm-5 version's score (45) wins for the whole line; variant+alias
+    # join it via _base_slug (tie → stable catalog order); unranked last
+    assert [m["id"] for m in r.json()] == ["b/small", "a/glm-5:free", "~a/glm-5", "c/unranked"]
+    assert all(set(m) == {"id", "name", "input_cost", "output_cost"} for m in r.json())
+    assert benchmarks.call_count == 1  # cached alongside the catalog
+
+
+@pytest.mark.anyio
+@respx.mock
 async def test_models_upstream_error_is_a_clean_502(dclient, monkeypatch):
     await dclient.get("/api/auth/dev-login")
 
