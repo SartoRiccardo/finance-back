@@ -15,6 +15,9 @@ dependencies = [
     "pyjwt[crypto]>=2.9",
     "google-genai>=2.23.0",
     "python-multipart>=0.0.32",
+    "imap-tools>=1.15.0",
+    "markdownify>=1.2.3",
+    "pypdf>=6.18.1",
 ]
 
 [dependency-groups]

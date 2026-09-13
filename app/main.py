@@ -11,6 +11,7 @@ from app.auth import register_dev_login, router as auth_router
 from app.config import Settings, get_settings
 from app.db import SessionLocal
 from app.drafts import router as drafts_router
+from app.email_ingest import start_email_poller
 from app.ledger import router as ledger_router
 from app.llm import ensure_app_settings, router as llm_router
 from app.reports import router as reports_router
@@ -32,7 +33,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Runs env.py, which spins its own event loop — hence the thread.
         await asyncio.to_thread(upgrade_head)
         await ensure_app_settings(settings)
+        poller = start_email_poller(settings)  # None (inert) without INGEST_IMAP_HOST
         yield
+        if poller:
+            poller.cancel()
 
     app = FastAPI(title="Personal Finance API", lifespan=lifespan)
     app.state.settings = settings

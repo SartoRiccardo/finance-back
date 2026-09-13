@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     openrouter_api_key: str = ""
     upload_dir: str = "data/uploads"
+    # V6 email ingestion — INGEST_IMAP_HOST unset ⇒ feature fully inert (no task, no errors).
+    ingest_imap_host: str = ""
+    ingest_imap_port: int = 993
+    ingest_imap_user: str = ""
+    ingest_imap_password: str = ""
+    ingest_mail_alias: str = ""
+    ingest_poll_seconds: int = 60
 
     @property
     def dev_auth_enabled(self) -> bool:

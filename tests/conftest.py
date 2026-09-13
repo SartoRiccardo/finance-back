@@ -27,6 +27,11 @@ TEST_SETTINGS = {
     # empty so the suite stays hermetic even with real keys in the developer's .env
     "google_api_key": "",
     "openrouter_api_key": "",
+    # email ingestion pinned off — no test ever dials the developer's real mailbox
+    "ingest_imap_host": "",
+    "ingest_imap_user": "",
+    "ingest_imap_password": "",
+    "ingest_mail_alias": "",
 }
 
 # Dedicated scratch database on the dev Postgres server; never touches the dev `pf` DB.

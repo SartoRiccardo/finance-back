@@ -42,6 +42,12 @@ EXTRACT_PROMPTS = {
         "in euros as a positive number, and the best-fitting category from the allowed values. "
         "Skip totals, payment methods and change."
     ),
+    "email": (
+        "This is an emailed receipt or order confirmation. Extract every purchased line item as a row: "
+        "the item's date (fall back to the order date), a short description, the line amount "
+        "in euros as a positive number, and the best-fitting category from the allowed values. "
+        "Skip totals, shipping, signatures, footers and marketing text."
+    ),
 }
 
 
@@ -53,6 +59,8 @@ class DraftOut(BaseModel):
     status: str
     error: str | None = None
     upload_id: uuid.UUID | None
+    # email drafts only: {"from", "date" (ISO 8601), "subject"}; null for photo drafts
+    email_meta: dict | None = None
     created_at: datetime
     rows: list[TxnOut]
 
