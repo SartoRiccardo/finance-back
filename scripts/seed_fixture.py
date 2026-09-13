@@ -30,6 +30,22 @@ FIXTURE = [
     (11, "33.00", "390.00", "0.00"), (12, "33.52", "403.00", "0.00"),
 ]
 
+# Row-level split of the monthly "spent" total across categories (parity-based
+# weights, deterministic). Monthly sums stay identical to the reference table —
+# only the category split changes. Weights per list sum to exactly 1.
+SPLIT_ODD = [("Takeout", "0.22"), ("Ingredients", "0.18"), ("Transport", "0.12"),
+             ("Social life", "0.12"), ("Self Care", "0.08"), ("Girlfriend", "0.05"),
+             ("Sewing", "0.15"), ("Misc", "0.08")]
+SPLIT_EVEN = [("Takeout", "0.16"), ("Ingredients", "0.22"), ("Transport", "0.10"),
+              ("Social life", "0.10"), ("Self Care", "0.10"), ("Girlfriend", "0.06"),
+              ("Education", "0.18"), ("Misc", "0.08")]
+
+
+def split_spent(total: Decimal, weights: list[tuple[str, str]]) -> list[tuple[str, Decimal]]:
+    parts = [(name, (total * Decimal(w)).quantize(Decimal("0.01"))) for name, w in weights]
+    parts[-1] = (parts[-1][0], total - sum(p[1] for p in parts[:-1]))  # absorb cent rounding
+    return [(name, amt) for name, amt in parts if amt]
+
 
 async def main(year: int) -> None:
     async with SessionLocal() as s:
@@ -45,8 +61,9 @@ async def main(year: int) -> None:
         for m, spent, invested, earned in FIXTURE:
             day = datetime.date(year, m, 15)
             s.add_all([
-                Transaction(user_id=user.id, date=day, description="V3 fixture",
-                            amount=Decimal(spent), direction="spend", category_id=cats["Misc"]),
+                *[Transaction(user_id=user.id, date=day, description="V3 fixture",
+                              amount=amt, direction="spend", category_id=cats[name])
+                  for name, amt in split_spent(Decimal(spent), SPLIT_ODD if m % 2 else SPLIT_EVEN)],
                 Transaction(user_id=user.id, date=day, description="V3 fixture",
                             amount=Decimal(invested), direction="spend", category_id=cats["Investment"]),
                 *([Transaction(user_id=user.id, date=day, description="V3 fixture",
