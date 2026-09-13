@@ -11,7 +11,7 @@ from app.auth import register_dev_login, router as auth_router
 from app.config import Settings, get_settings
 from app.drafts import router as drafts_router
 from app.ledger import router as ledger_router
-from app.llm import ensure_app_settings
+from app.llm import ensure_app_settings, router as llm_router
 from app.reports import router as reports_router
 
 log = logging.getLogger("pf")
@@ -44,6 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(ledger_router, prefix="/api")
     app.include_router(reports_router, prefix="/api")
     app.include_router(drafts_router, prefix="/api")
+    app.include_router(llm_router, prefix="/api")
     if settings.dev_auth_enabled:
         register_dev_login(app, settings)
 
