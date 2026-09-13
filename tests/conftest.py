@@ -2,17 +2,18 @@ import base64
 import time
 import uuid
 
+import asyncpg
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 from app.config import Settings
 from app.db import get_db
 from app.main import create_app
-from app.models import Base
+from app.models import Base, seed
 
 TEST_SETTINGS = {
     "database_url": "sqlite+aiosqlite://",
@@ -25,12 +26,38 @@ TEST_SETTINGS = {
     "dev_auth_bypass": True,
 }
 
+# Dedicated scratch database on the dev Postgres server; never touches the dev `pf` DB.
+PG_URL = "postgresql+asyncpg://pf:pf@localhost:5432/pf_test"
+PG_DSN = "postgresql://pf:pf@localhost:5432/pf"
 
-@pytest.fixture
-async def db():
-    engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
+
+async def _pg_engine():
+    """Engine on the scratch Postgres DB, or None if the dev server is unreachable."""
+    try:
+        admin = await asyncpg.connect(PG_DSN)
+    except (OSError, asyncpg.PostgresError):
+        return None
+    try:
+        await admin.execute("CREATE DATABASE pf_test")
+    except asyncpg.DuplicateDatabaseError:
+        pass
+    await admin.close()
+    return create_async_engine(PG_URL, poolclass=NullPool)
+
+
+@pytest.fixture(params=["sqlite", "postgres"], ids=["sqlite", "pg"])
+async def db(request):
+    """Every feature test runs on in-memory sqlite AND on real Postgres (when reachable)."""
+    if request.param == "sqlite":
+        engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
+    else:
+        engine = await _pg_engine()
+        if engine is None:
+            pytest.skip("dev Postgres not reachable")
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(seed)
     yield async_sessionmaker(engine, expire_on_commit=False)
     await engine.dispose()
 
