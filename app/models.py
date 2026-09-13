@@ -50,6 +50,7 @@ class Category(TimestampMixin, Base):
     description: Mapped[str | None]
     is_investment: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     sort_order: Mapped[int] = mapped_column(default=0, server_default="0")
+    color: Mapped[str | None] = mapped_column(String(7))
 
 
 class Label(TimestampMixin, Base):
@@ -58,6 +59,7 @@ class Label(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True)
     is_spending: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    color: Mapped[str | None] = mapped_column(String(7))
 
 
 class Transaction(TimestampMixin, Base):
@@ -103,14 +105,45 @@ SEED_CATEGORIES = [
 ]
 SEED_LABELS = ["tip", "fumofumo", "payback", "salary"]
 
+# Preset hex colors (same palette as front/src/lib/palette.ts) — the single
+# source for both fresh seeds and the 0003 backfill on existing databases.
+CATEGORY_COLORS = {
+    "Education": "#3b82f6",  # blue
+    "Sewing": "#8b5cf6",  # violet
+    "Chinese Plushies": "#ec4899",  # pink
+    "Investment": "#10b981",  # emerald
+    "Girlfriend": "#f43f5e",  # rose
+    "Social life": "#f59e0b",  # amber
+    "Ingredients": "#84cc16",  # lime
+    "Takeout": "#f97316",  # orange
+    "Self Care": "#14b8a6",  # teal
+    "Transport": "#0ea5e9",  # sky
+    "Misc": "#6b7280",  # gray
+}
+LABEL_COLORS = {
+    "tip": "#eab308",  # yellow
+    "fumofumo": "#d946ef",  # fuchsia
+    "payback": "#06b6d4",  # cyan
+    "salary": "#22c55e",  # green
+}
+
 
 def seed(bind) -> None:
     """Insert seed rows. bind is a Connection (migrations) or Session (tests)."""
     bind.execute(
         insert(Category),
         [
-            {"name": n, "description": d, "is_investment": inv, "sort_order": i}
+            {
+                "name": n,
+                "description": d,
+                "is_investment": inv,
+                "sort_order": i,
+                "color": CATEGORY_COLORS.get(n),
+            }
             for i, (n, d, inv) in enumerate(SEED_CATEGORIES)
         ],
     )
-    bind.execute(insert(Label), [{"name": n, "is_spending": False} for n in SEED_LABELS])
+    bind.execute(
+        insert(Label),
+        [{"name": n, "is_spending": False, "color": LABEL_COLORS.get(n)} for n in SEED_LABELS],
+    )

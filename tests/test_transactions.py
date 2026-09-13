@@ -238,3 +238,30 @@ async def test_schema_enforces_direction_and_money_at_db_level(client, db):
         await s.execute(sql(amount="999999999.99", category_id=misc))
         row = (await s.execute(select(Transaction))).scalar_one()
         assert row.amount == Decimal("999999999.99")
+
+
+@pytest.mark.anyio
+async def test_taxonomy_colors(client):
+    await client.get("/api/auth/dev-login")
+
+    cats = (await client.get("/api/categories")).json()
+    edu = next(c for c in cats if c["name"] == "Education")
+    assert edu["color"] == "#3b82f6"
+    plushies = next(c for c in cats if c["name"] == "Chinese Plushies")
+    assert plushies["color"] == "#ec4899"
+
+    labels = (await client.get("/api/labels")).json()
+    tip = next(l for l in labels if l["name"] == "tip")
+    assert tip["color"] == "#eab308"
+
+    r = await client.patch(f"/api/categories/{edu['id']}", json={"color": "#ef4444"})
+    assert r.status_code == 200 and r.json()["color"] == "#ef4444"
+
+    r = await client.patch(f"/api/categories/{edu['id']}", json={"color": "red"})
+    assert r.status_code == 422
+
+    r = await client.patch(f"/api/labels/{tip['id']}", json={"color": "#84cc16"})
+    assert r.status_code == 200 and r.json()["color"] == "#84cc16"
+
+    r = await client.patch("/api/labels/99999", json={"color": "#84cc16"})
+    assert r.status_code == 404

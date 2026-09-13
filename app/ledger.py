@@ -22,6 +22,7 @@ class CategoryOut(BaseModel):
     description: str | None
     is_investment: bool
     sort_order: int
+    color: str | None
 
 
 class LabelOut(BaseModel):
@@ -30,6 +31,7 @@ class LabelOut(BaseModel):
     id: int
     name: str
     is_spending: bool
+    color: str | None
 
 
 class CategoryIn(BaseModel):
@@ -37,6 +39,7 @@ class CategoryIn(BaseModel):
     description: str | None = None
     is_investment: bool = False
     sort_order: int = 0
+    color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class CategoryPatch(BaseModel):
@@ -44,6 +47,11 @@ class CategoryPatch(BaseModel):
     description: str | None = None
     is_investment: bool | None = None
     sort_order: int | None = None
+    color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
+
+
+class LabelPatch(BaseModel):
+    color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class TxnIn(BaseModel):
@@ -162,6 +170,16 @@ async def delete_category(category_id: int, db: AsyncSession = Depends(get_db)):
 @router.get("/labels", response_model=list[LabelOut])
 async def list_labels(db: AsyncSession = Depends(get_db)):
     return (await db.scalars(select(Label).order_by(Label.name))).all()
+
+
+@router.patch("/labels/{label_id}", response_model=LabelOut)
+async def update_label(label_id: int, body: LabelPatch, db: AsyncSession = Depends(get_db)):
+    label = await _get_or_404(db, Label, label_id)
+    for key, value in body.model_dump(exclude_unset=True).items():
+        setattr(label, key, value)
+    await db.commit()
+    await db.refresh(label)
+    return label
 
 
 # --- transactions ---
