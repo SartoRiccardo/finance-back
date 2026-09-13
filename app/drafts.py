@@ -23,7 +23,7 @@ from app.config import Settings
 from app.db import get_db
 from app.ledger import TxnIn, TxnOut, TxnPatch, _check_refs
 from app.llm import LLMClient, LLMError, get_llm, rows_schema, usage_cost
-from app.models import Category, Draft, LLMUsage, Transaction, Upload, User
+from app.models import AppSetting, Category, Draft, LLMUsage, Transaction, Upload, User
 
 router = APIRouter(tags=["drafts"], dependencies=[Depends(get_current_user)])
 
@@ -122,9 +122,12 @@ async def create_draft_from_content(
         '{"rows": [{"date": "YYYY-MM-DD", "description": "short item", "amount": 12.34, '
         '"category": "<best fit: ' + menu + '">}]}'
     )
-    raw, usage = await llm.complete_structured(
-        rows_schema([c.name for c in categories]), [f"{prompt}\n\n{shape}", payload]
-    )
+    contents = [f"{prompt}\n\n{shape}", payload]
+    # The owner's own quirks (e.g. what odd items are) go last — they refine the mapping.
+    row = await db.get(AppSetting, 1)
+    if row is not None and row.custom_prompt and row.custom_prompt.strip():
+        contents[0] += f"\n\nOwner's mapping rules (they win when a category fits):\n{row.custom_prompt.strip()}"
+    raw, usage = await llm.complete_structured(rows_schema([c.name for c in categories]), contents)
     rows = _rows_from_llm(raw, cat_ids, cat_ids["misc"])
 
     draft = draft or Draft(source=source, upload_id=upload_id, email_meta=email_meta)

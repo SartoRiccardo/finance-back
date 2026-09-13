@@ -96,9 +96,10 @@ async def test_settings_round_trip_persists_row(dclient, db):
     # env defaults before any PUT (startup never ran in tests, so no row yet)
     r = await dclient.get("/api/settings")
     assert r.status_code == 200
-    assert r.json() == {"llm_provider": "google", "llm_model": "gemini-2.5-flash"}
+    assert r.json() == {"llm_provider": "google", "llm_model": "gemini-2.5-flash", "custom_prompt": ""}
 
-    body = {"llm_provider": "openrouter", "llm_model": "qwen/qwen3-vl-235b"}
+    body = {"llm_provider": "openrouter", "llm_model": "qwen/qwen3-vl-235b",
+            "custom_prompt": "apple vinegar goes in Self Care"}
     r = await dclient.put("/api/settings", json=body)
     assert r.status_code == 200 and r.json() == body
     assert (await dclient.get("/api/settings")).json() == body
@@ -106,6 +107,7 @@ async def test_settings_round_trip_persists_row(dclient, db):
     async with db() as s:
         row = await s.get(AppSetting, 1)
         assert (row.llm_provider, row.llm_model) == (body["llm_provider"], body["llm_model"])
+        assert row.custom_prompt == "apple vinegar goes in Self Care"
 
 
 @pytest.mark.anyio
@@ -114,6 +116,8 @@ async def test_settings_round_trip_persists_row(dclient, db):
     {"llm_provider": "google", "llm_model": ""},           # empty model
     {"llm_provider": "google"},                            # missing model
     {"llm_model": "gemini-2.5-flash"},                     # missing provider
+    {"llm_provider": "google", "llm_model": "gemini-2.5-flash",
+     "custom_prompt": "x" * 2001},                         # prompt over the column cap
 ])
 async def test_settings_validation_rejects_and_persists_nothing(dclient, db, body):
     await dclient.get("/api/auth/dev-login")
@@ -121,6 +125,27 @@ async def test_settings_validation_rejects_and_persists_nothing(dclient, db, bod
     assert r.status_code == 422, r.text
     async with db() as s:
         assert (await s.scalars(select(AppSetting))).all() == []
+
+
+@pytest.mark.anyio
+async def test_custom_prompt_preserved_by_partial_put_and_clearable(dclient):
+    """A picker save carries no custom_prompt — it must survive; only '' (or blank) clears."""
+    await dclient.get("/api/auth/dev-login")
+    assert (await dclient.put("/api/settings", json={
+        "llm_provider": "google", "llm_model": "gemini-2.5-flash",
+        "custom_prompt": "  apple vinegar goes in Self Care  ",
+    })).status_code == 200
+    assert (await dclient.get("/api/settings")).json()["custom_prompt"] == \
+        "apple vinegar goes in Self Care"  # stored stripped
+
+    assert (await dclient.put("/api/settings", json={
+        "llm_provider": "openrouter", "llm_model": "qwen/qwen3-vl-235b",
+    })).json() == {"llm_provider": "openrouter", "llm_model": "qwen/qwen3-vl-235b",
+                   "custom_prompt": "apple vinegar goes in Self Care"}
+
+    assert (await dclient.put("/api/settings", json={
+        "llm_provider": "openrouter", "llm_model": "qwen/qwen3-vl-235b", "custom_prompt": " ",
+    })).json()["custom_prompt"] == ""
 
 
 @pytest.mark.anyio

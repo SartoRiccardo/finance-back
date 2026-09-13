@@ -90,6 +90,27 @@ async def cid(client, name: str) -> int:
 
 
 @pytest.mark.anyio
+async def test_custom_prompt_is_appended_to_extraction_prompt(dclient):
+    await dclient.get("/api/auth/dev-login")
+    r = await dclient.put("/api/settings", json={
+        "llm_provider": "google", "llm_model": "gemini-2.5-flash",
+        "custom_prompt": "apple vinegar goes in Self Care",
+    })
+    assert r.status_code == 200, r.text
+
+    fake = FakeLLM(GOOD_ROWS)
+    upload_id = await upload_receipt(dclient)
+    use_llm(dclient, fake)
+    r = await dclient.post("/api/drafts/from-upload", json={"upload_id": upload_id})
+    assert (await wait_draft(dclient, r.json()["id"]))["status"] == "open"
+
+    prompt = fake.calls[0][1][0]  # (schema, contents) → the text part
+    assert "apple vinegar goes in Self Care" in prompt
+    # appended after the JSON-shape instructions, not replacing them
+    assert prompt.index("Respond with ONLY a JSON object") < prompt.index("apple vinegar")
+
+
+@pytest.mark.anyio
 async def test_draft_endpoints_require_auth(client):
     for method, path in [
         ("post", "/api/uploads"), ("get", "/api/uploads/00000000-0000-0000-0000-000000000000"),
