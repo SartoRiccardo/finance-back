@@ -1,0 +1,26 @@
+[project]
+name = "pf-api"
+version = "0.1.0"
+description = "Personal Finance API"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic-settings>=2.4",
+    "itsdangerous>=2.2",
+    "httpx>=0.27",
+    "pyjwt[crypto]>=2.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "aiosqlite>=0.20",
+    "respx>=0.21",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
