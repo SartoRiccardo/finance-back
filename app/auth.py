@@ -1,7 +1,9 @@
+import hashlib
 import logging
+import re
 import secrets
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
@@ -13,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db import get_db
-from app.models import User
+from app.models import ApiKey, User
 
 log = logging.getLogger("pf.auth")
 
@@ -73,8 +75,43 @@ async def get_current_user(
 ) -> User:
     user = await _load_user(db, settings, request.cookies.get(SESSION_COOKIE))
     if user is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        auth = request.headers.get("authorization", "")
+        if auth[:7].lower() == "bearer ":
+            user = await _user_from_key(db, auth[7:].strip())
+        if user is None:
+            raise HTTPException(status_code=401, detail="Not authenticated")
     return user
+
+
+# pf_ + 32 hex — the only Bearer shape this API mints; anything else is garbage → 401.
+KEY_FORMAT = re.compile(r"pf_[0-9a-f]{32}")
+KEY_REUSE_WINDOW = timedelta(minutes=1)
+
+
+def hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _aware(dt: datetime) -> datetime:
+    # Postgres returns tz-aware, sqlite naive (stored UTC) — normalize before arithmetic.
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+async def _user_from_key(db: AsyncSession, token: str) -> User | None:
+    if not KEY_FORMAT.fullmatch(token):
+        return None
+    row = (await db.execute(
+        select(ApiKey).where(ApiKey.key_hash == hash_key(token))
+    )).scalar_one_or_none()
+    if row is None or row.revoked_at is not None:  # revoked keys are dead forever
+        return None
+    user_id = row.user_id
+    now = datetime.now(UTC)
+    if row.last_used_at is None or now - _aware(row.last_used_at) >= KEY_REUSE_WINDOW:
+        # throttled write: at most once/minute/key
+        row.last_used_at = now
+        await db.commit()
+    return await db.get(User, user_id)
 
 
 async def _exchange_code(settings: Settings, code: str, redirect_uri: str) -> dict:

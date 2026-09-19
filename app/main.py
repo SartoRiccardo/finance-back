@@ -13,6 +13,7 @@ from app.db import SessionLocal
 from app.drafts import router as drafts_router
 from app.email_ingest import start_email_poller
 from app.ledger import router as ledger_router
+from app.keys import router as keys_router
 from app.llm import ensure_app_settings, router as llm_router
 from app.reports import router as reports_router
 
@@ -51,6 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(reports_router, prefix="/api")
     app.include_router(drafts_router, prefix="/api")
     app.include_router(llm_router, prefix="/api")
+    app.include_router(keys_router, prefix="/api")
     if settings.dev_auth_enabled:
         register_dev_login(app, settings)
 

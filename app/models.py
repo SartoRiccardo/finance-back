@@ -139,6 +139,24 @@ class LLMUsage(TimestampMixin, Base):
     draft_id: Mapped[int | None] = mapped_column(ForeignKey("drafts.id"))
 
 
+class ApiKey(Base):
+    """A minted bearer key — only the sha256 hex is stored; the full key is shown once."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    key_prefix: Mapped[str] = mapped_column(String(12))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # explicit tz-aware type: app writes aware UTC datetimes (asyncpg rejects them for plain timestamp)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AppSetting(Base):
     """Single row (id=1) holding runtime-flippable config; created from env defaults on startup."""
 
