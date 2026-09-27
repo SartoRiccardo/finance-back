@@ -208,7 +208,15 @@ async def _flag_duplicate(
             draft.possible_duplicate = True
         await db.commit()
     except Exception as exc:
-        log.warning("draft %s duplicate check skipped: %s", draft.id, exc)
+        # Fail safe: a broken judge must not silently pass — assume "duplicate"
+        # and let the human decide. The extraction itself stays untouched either way.
+        log.warning("draft %s duplicate check failed, flagging anyway: %s", draft.id, exc)
+        try:
+            await db.rollback()  # clear a half-open transaction, if any
+            draft.possible_duplicate = True
+            await db.commit()
+        except Exception:
+            log.warning("draft %s duplicate flag could not be saved", draft.id)
 
 
 # --- detached extraction: the draft is visible as "processing" while this runs ---

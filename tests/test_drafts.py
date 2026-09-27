@@ -510,7 +510,14 @@ async def test_failed_duplicate_check_never_fails_the_draft(dclient, db):
             return await super().complete_structured(schema, contents)
 
     draft = await make_draft(dclient, FlakyDup(GOOD_ROWS))
-    assert draft["status"] == "open" and draft["possible_duplicate"] is False
+    # judge failed → fail safe: draft survives AND is flagged as possibly duplicated.
+    # The flag lands in a second commit (with no usage row to gate on), so poll for it.
+    for _ in range(200):
+        body = (await dclient.get(f"/api/drafts/{draft['id']}")).json()
+        if body["possible_duplicate"]:
+            break
+        await asyncio.sleep(0.005)
+    assert body["status"] == "open" and body["possible_duplicate"] is True
     async with db() as s:
         stored = await s.get(Draft, draft["id"])
         assert stored.status == "open" and stored.error is None
