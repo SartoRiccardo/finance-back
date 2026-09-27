@@ -48,16 +48,16 @@ def an_email(**over) -> InboundEmail:
 
 
 class FakeSource:
-    """In-memory transport; records \\Seen marks."""
+    """In-memory transport; records deletions."""
 
     def __init__(self, emails):
-        self.emails, self.seen = list(emails), []
+        self.emails, self.deleted = list(emails), []
 
     async def fetch_new(self):
         return list(self.emails)
 
-    async def mark_seen(self, message_id):
-        self.seen.append(message_id)
+    async def delete_message(self, message_id):
+        self.deleted.append(message_id)
 
 
 async def add_user(db, addr="me@test.dev"):
@@ -92,7 +92,7 @@ async def test_email_becomes_draft_via_shared_pipeline(client, db, monkeypatch):
     source = FakeSource([an_email()])
     await poll(db, source, fake, monkeypatch)
 
-    assert source.seen == ["uid-1"]  # draft committed → and only now marked
+    assert source.deleted == ["uid-1"]  # draft committed → and only now deleted
     payload = fake.calls[0][1][1]  # (prompt, payload) → the email text
     assert "From: me@test.dev" in payload and "Subject: Your order" in payload
     assert "| Yarn | 23.45 EUR |" in payload  # markdownified body, not HTML
@@ -125,22 +125,22 @@ async def test_non_whitelisted_sender_skipped_silently(db, monkeypatch):
     source = FakeSource([an_email(sender="stranger@evil.dev")])
     await poll(db, source, FakeLLM(GOOD_ROWS), monkeypatch)
 
-    assert source.seen == []  # no draft → no \Seen → it re-polls for free
+    assert source.deleted == []  # no draft → not deleted → it re-polls for free
     async with db() as s:
         assert (await s.scalars(select(Draft))).all() == []
 
 
 @pytest.mark.anyio
-async def test_seen_only_after_draft_commits(db, monkeypatch):
+async def test_deleted_only_after_draft_commits(db, monkeypatch):
     await add_user(db)
     source = FakeSource([an_email()])
     await poll(db, source, FakeLLM(error="Gemini call failed: 429"), monkeypatch)
-    assert source.seen == []  # failed extraction → retried next poll
+    assert source.deleted == []  # failed extraction → still in the mailbox, retried next poll
     async with db() as s:
         assert (await s.scalars(select(Draft))).all() == []
 
     await poll(db, source, FakeLLM(GOOD_ROWS), monkeypatch)  # same message again
-    assert source.seen == ["uid-1"]
+    assert source.deleted == ["uid-1"]
 
 
 @pytest.mark.anyio
@@ -150,7 +150,7 @@ async def test_malformed_content_skips_cleanly(db, monkeypatch):
     await poll(db, source, fake, monkeypatch)  # no raise
 
     assert fake.calls == []  # nothing extractable → no LLM call at all
-    assert source.seen == []
+    assert source.deleted == []
     async with db() as s:
         assert (await s.scalars(select(Draft))).all() == []
 

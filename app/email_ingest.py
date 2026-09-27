@@ -3,8 +3,8 @@
 The poller runs in-process (started by main's lifespan only when INGEST_IMAP_HOST
 is set — unset means fully inert) and pushes every alias-matching message
 through the same `create_draft_from_content` pipeline photo drafts use. Dedupe
-is unseen + \\Seen-marking: a message is marked read only after its draft is
-committed, so a crash before that point replays it on the next poll.
+is unseen + delete-on-success: a message is deleted (Gmail: → Trash) only after
+its draft is committed, so a crash before that point replays it on the next poll.
 """
 
 import asyncio
@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from typing import Protocol
 
-from imap_tools import AND, MailBox, MailMessageFlags
+from imap_tools import AND, MailBox
 from markdownify import markdownify
 from sqlalchemy import func, select
 
@@ -116,7 +116,9 @@ class ImapIngestionSource:
         with self._login() as box:
             # mark_seen=False: \Seen is ours to set, only after the draft commits
             for msg in box.fetch(AND(seen=False), mark_seen=False):
-                addrs = [*(msg.to or []), *(msg.cc or []), *msg.headers_values("delivered-to")]
+                # imap-tools 1.x exposes headers as a dict; alias may arrive via Delivered-To
+                delivered = next((v for k, v in msg.headers.items() if k.lower() == "delivered-to"), [])
+                addrs = [*(msg.to or []), *(msg.cc or []), *delivered]
                 if not matches_alias(addrs, alias):
                     continue  # not addressed to the alias — never touched, stays unread
                 out.append(InboundEmail(
@@ -133,12 +135,12 @@ class ImapIngestionSource:
                 ))
         return out
 
-    async def mark_seen(self, message_id: str) -> None:
-        await asyncio.to_thread(self._mark_seen_sync, message_id)
+    async def delete_message(self, message_id: str) -> None:
+        await asyncio.to_thread(self._delete_sync, message_id)
 
-    def _mark_seen_sync(self, uid: str) -> None:
+    def _delete_sync(self, uid: str) -> None:
         with self._login() as box:
-            box.flag(uid, MailMessageFlags.SEEN, True)
+            box.delete(uid)  # Gmail: → Trash (30-day safety net), not immediate purge
 
 
 async def process_email(
@@ -171,7 +173,7 @@ async def process_email(
 
 
 async def poll_once(settings: Settings, db_factory, source: EmailIngestionSource) -> None:
-    """One pass: fetch → whitelist → shared pipeline → mark seen on success."""
+    """One pass: fetch → whitelist → shared pipeline → delete on success."""
     try:
         emails = await source.fetch_new()
     except Exception as exc:
@@ -192,8 +194,8 @@ async def poll_once(settings: Settings, db_factory, source: EmailIngestionSource
             # stays UNSEEN — the next poll retries it (crash-safe by construction)
             log.warning("email %s failed, will retry next poll: %s", email.message_id, exc)
             continue
-        if draft is not None and (mark := getattr(source, "mark_seen", None)):
-            await mark(email.message_id)  # only here: the draft is committed
+        if draft is not None and (delete := getattr(source, "delete_message", None)):
+            await delete(email.message_id)  # only here: the draft is committed
 
 
 async def poll_forever(settings: Settings, db_factory) -> None:

@@ -19,6 +19,13 @@ from app.reports import router as reports_router
 
 log = logging.getLogger("pf")
 
+# pf.* logs at INFO (poller confirmations, "email → draft N"); without a handler
+# Python's last-resort default only surfaces WARNING+, hiding exactly those lines.
+_pf_handler = logging.StreamHandler()
+_pf_handler.setFormatter(logging.Formatter("%(levelname)s  [%(name)s] %(message)s"))
+log.addHandler(_pf_handler)
+log.setLevel(logging.INFO)
+
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 
 
