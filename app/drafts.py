@@ -7,6 +7,7 @@ with a str payload instead of image bytes. Endpoints stay thin.
 """
 
 import asyncio
+import logging
 import uuid
 from datetime import date, datetime
 from decimal import Decimal, DecimalException
@@ -22,10 +23,12 @@ from app.auth import get_app_settings, get_current_user
 from app.config import Settings
 from app.db import get_db
 from app.ledger import TxnIn, TxnOut, TxnPatch, _check_refs
-from app.llm import LLMClient, LLMError, get_llm, rows_schema, usage_cost
+from app.llm import LLMClient, LLMError, bool_schema, get_llm, rows_schema, usage_cost
 from app.models import AppSetting, Category, Draft, LLMUsage, Transaction, Upload, User
 
 router = APIRouter(tags=["drafts"], dependencies=[Depends(get_current_user)])
+
+log = logging.getLogger("pf.drafts")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 IMAGE_EXTS = {
@@ -62,6 +65,7 @@ class DraftOut(BaseModel):
     # email drafts only: {"from", "date" (ISO 8601), "subject"}; null for photo drafts
     email_meta: dict | None = None
     created_at: datetime
+    possible_duplicate: bool = False
     rows: list[TxnOut]
 
 
@@ -160,7 +164,51 @@ async def create_draft_from_content(
     ))
     await db.commit()
     await db.refresh(draft, ["rows"])  # the collection isn't loaded on a brand-new draft
+    await _flag_duplicate(db, user_id, llm, settings, draft)
     return draft
+
+
+def _fmt_rows(rows) -> str:
+    return "\n".join(f"{r.date} | {r.description} | {r.amount}" for r in rows)
+
+
+async def _flag_duplicate(
+    db: AsyncSession, user_id: uuid.UUID, llm: LLMClient, settings: Settings, draft: Draft
+) -> None:
+    """V10a post-pass: one conditional second LLM call — does the ledger already hold this?
+
+    Zero cost when no approved transactions share the rows' dates. Tolerate-and-continue
+    like the email poller: a broken check leaves the draft open and unflagged, never
+    fails the already-committed draft.
+    """
+    try:
+        dates = {r.date for r in draft.rows}
+        existing = (await db.scalars(select(Transaction).where(
+            Transaction.user_id == user_id,
+            Transaction.is_draft.is_(False),
+            Transaction.date.in_(dates),
+        ))).all()
+        if not existing:
+            return  # nothing on those days to duplicate — no LLM call at all
+        raw, usage = await llm.complete_structured(bool_schema(), [(
+            "A receipt is about to be added to a personal ledger. Decide whether its "
+            "purchases are already recorded there. Answer with ONLY a JSON object "
+            '(no markdown, no prose): {"duplicate": true|false} — true only when the '
+            "existing rows record the same purchase(s) as the extracted rows, not "
+            "merely a same-day same-category coincidence.\n\n"
+            f"EXTRACTED:\n{_fmt_rows(draft.rows)}\nEXISTING:\n{_fmt_rows(existing)}"
+        )])
+        db.add(LLMUsage(
+            provider=llm.provider, model=llm.model,
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+            cost_usd=await usage_cost(llm.provider, llm.model, usage, settings),
+            draft_id=draft.id,
+        ))
+        if isinstance(raw, dict) and raw.get("duplicate") is True:
+            draft.possible_duplicate = True
+        await db.commit()
+    except Exception as exc:
+        log.warning("draft %s duplicate check skipped: %s", draft.id, exc)
 
 
 # --- detached extraction: the draft is visible as "processing" while this runs ---

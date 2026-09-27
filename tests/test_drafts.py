@@ -3,13 +3,14 @@
 import asyncio
 import base64
 import uuid
+from datetime import date
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
 
 from app.llm import LLMError, Usage, get_llm
-from app.models import Draft, Transaction, Upload
+from app.models import Category, Draft, LLMUsage, Transaction, Upload, User
 
 # 1x1 transparent png
 PNG = base64.b64decode(
@@ -25,11 +26,12 @@ GOOD_ROWS = {
 
 
 class FakeLLM:
-    """Stands in for both real clients."""
+    """Stands in for both real clients. `payload` is one response, or a per-call list."""
 
     def __init__(self, payload=None, error=None, delay=0, usage=None):
         self.provider, self.model = "google", "fake-model"
-        self.payload, self.error, self.delay = payload, error, delay
+        self.responses = list(payload) if isinstance(payload, list) else [payload]
+        self.error, self.delay = error, delay
         self.usage = usage or Usage()
         self.calls = []
 
@@ -39,7 +41,8 @@ class FakeLLM:
             await asyncio.sleep(self.delay)
         if self.error:
             raise LLMError(self.error)
-        return self.payload, self.usage
+        # consume the queue in order; the last response repeats
+        return (self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]), self.usage
 
 
 def use_llm(client, fake):
@@ -78,10 +81,22 @@ async def wait_draft(client, draft_id: int) -> dict:
 
 async def make_draft(client, payload=GOOD_ROWS) -> dict:
     upload_id = await upload_receipt(client)
-    use_llm(client, FakeLLM(payload))
+    use_llm(client, payload if isinstance(payload, FakeLLM) else FakeLLM(payload))
     r = await client.post("/api/drafts/from-upload", json={"upload_id": upload_id})
     assert r.status_code == 201, r.text
     return await wait_draft(client, r.json()["id"])
+
+
+async def seed_approved_txn(db, day="2026-09-10"):
+    """A real (non-draft) transaction on an extraction date, so the post-pass has a hit."""
+    async with db() as s:
+        user = (await s.scalars(select(User))).one()
+        ingredients = (await s.scalars(select(Category).where(Category.name == "Ingredients"))).one()
+        s.add(Transaction(
+            user_id=user.id, date=date.fromisoformat(day), description="Coop run",
+            amount=Decimal("23.45"), direction="spend", category_id=ingredients.id,
+        ))
+        await s.commit()
 
 
 async def cid(client, name: str) -> int:
@@ -402,3 +417,101 @@ async def test_draft_row_crud_validates_like_transactions(dclient):
     assert r.status_code == 204
     assert len((await dclient.get(f"/api/drafts/{did}")).json()["rows"]) == 2
     assert (await dclient.delete(f"/api/drafts/{did}/rows/{row['id']}")).status_code == 404
+
+
+# --- V10a duplicate-detection post-pass ---
+
+
+async def wait_settled(client, draft_id: int, expected: bool) -> dict:
+    """The flag lands in a second commit after the draft goes open — wait for it.
+
+    The usage row commits alongside the flag, so a second usage row existing means
+    the post-pass finished; the expected flag gates the rest.
+    """
+    for _ in range(200):
+        body = (await client.get(f"/api/drafts/{draft_id}")).json()
+        calls = (await client.get("/api/llm/usage")).json()["totals"]["calls"]
+        if body["status"] == "open" and calls >= 2 and body["possible_duplicate"] == expected:
+            return body
+        await asyncio.sleep(0.005)
+    raise AssertionError("duplicate post-pass never settled")
+
+
+@pytest.mark.anyio
+async def test_no_approved_transactions_on_the_dates_skips_the_second_call(dclient):
+    await dclient.get("/api/auth/dev-login")
+    fake = FakeLLM([GOOD_ROWS, {"duplicate": True}])  # queued, never consumed
+    draft = await make_draft(dclient, fake)
+
+    assert len(fake.calls) == 1  # zero-cost path: extraction only
+    assert draft["status"] == "open" and draft["possible_duplicate"] is False
+
+
+@pytest.mark.anyio
+async def test_same_date_existing_rows_and_yes_flags_and_logs_usage(dclient, db):
+    await dclient.get("/api/auth/dev-login")
+    await seed_approved_txn(db)
+    fake = FakeLLM([GOOD_ROWS, {"duplicate": True}])
+    draft = await wait_settled(dclient, (await make_draft(dclient, fake))["id"], True)
+
+    assert draft["possible_duplicate"] is True
+    assert len(fake.calls) == 2
+    # second call is compact plaintext: extracted vs existing rows on those dates
+    prompt = fake.calls[1][1][0]
+    assert "EXTRACTED" in prompt and "EXISTING" in prompt and "Coop run" in prompt
+    assert fake.calls[1][0] == {
+        "type": "object",
+        "properties": {"duplicate": {"type": "boolean"}},
+        "required": ["duplicate"],
+        "additionalProperties": False,
+    }
+
+    page = (await dclient.get("/api/llm/usage")).json()
+    assert page["totals"]["calls"] == 2
+    assert page["recent"][0]["draft_id"] == draft["id"]  # second usage row, same draft
+
+
+@pytest.mark.anyio
+async def test_same_date_existing_rows_and_no_leaves_unflagged(dclient, db):
+    await dclient.get("/api/auth/dev-login")
+    await seed_approved_txn(db)
+    fake = FakeLLM([GOOD_ROWS, {"duplicate": False}])
+    draft = await wait_settled(dclient, (await make_draft(dclient, fake))["id"], False)
+
+    assert len(fake.calls) == 2
+    assert draft["possible_duplicate"] is False
+
+
+@pytest.mark.anyio
+async def test_flagged_draft_serializes_and_still_approves_and_discards(dclient, db):
+    await dclient.get("/api/auth/dev-login")
+    await seed_approved_txn(db)
+    draft = await make_draft(dclient, FakeLLM([GOOD_ROWS, {"duplicate": True}]))
+    draft = await wait_settled(dclient, draft["id"], True)
+    assert (await dclient.get(f"/api/drafts/{draft['id']}")).json()["possible_duplicate"] is True
+
+    r = await dclient.post(f"/api/drafts/{draft['id']}/approve")
+    assert r.status_code == 200 and r.json()["possible_duplicate"] is True
+
+    second = await make_draft(dclient, FakeLLM([GOOD_ROWS, {"duplicate": True}]))
+    await wait_settled(dclient, second["id"], True)
+    assert (await dclient.delete(f"/api/drafts/{second['id']}")).status_code == 204
+
+
+@pytest.mark.anyio
+async def test_failed_duplicate_check_never_fails_the_draft(dclient, db):
+    await dclient.get("/api/auth/dev-login")
+    await seed_approved_txn(db)
+
+    class FlakyDup(FakeLLM):
+        async def complete_structured(self, schema, contents):
+            if "duplicate" in schema.get("properties", {}):
+                raise LLMError("Gemini call failed: 503")
+            return await super().complete_structured(schema, contents)
+
+    draft = await make_draft(dclient, FlakyDup(GOOD_ROWS))
+    assert draft["status"] == "open" and draft["possible_duplicate"] is False
+    async with db() as s:
+        stored = await s.get(Draft, draft["id"])
+        assert stored.status == "open" and stored.error is None
+        assert len((await s.scalars(select(LLMUsage))).all()) == 1  # extraction only

@@ -119,6 +119,8 @@ class Draft(TimestampMixin, Base):
     # processing → open|error (extraction runs detached from the request)
     status: Mapped[str] = mapped_column(String(16), default="open", server_default="open")
     error: Mapped[str | None] = mapped_column(String(500))
+    # V10a: the conditional second LLM pass thinks the ledger already holds this purchase
+    possible_duplicate: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     upload: Mapped[Upload | None] = relationship(lazy="selectin")
     rows: Mapped[list[Transaction]] = relationship(foreign_keys="Transaction.draft_id", lazy="selectin")

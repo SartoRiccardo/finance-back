@@ -71,6 +71,16 @@ def rows_schema(category_names: list[str]) -> dict:
     }
 
 
+def bool_schema() -> dict:
+    """V10a duplicate-check contract: the model may only answer yes or no."""
+    return {
+        "type": "object",
+        "properties": {"duplicate": {"type": "boolean"}},
+        "required": ["duplicate"],
+        "additionalProperties": False,
+    }
+
+
 def _parts_for_gemini(contents: list[Part]):
     from google.genai import types
 
