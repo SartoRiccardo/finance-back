@@ -57,8 +57,9 @@ async def test_seeds_present(client):
 async def test_requires_auth(client):
     for method, path in [
         ("get", "/api/categories"), ("post", "/api/categories"),
-        ("get", "/api/labels"), ("get", "/api/transactions"),
-        ("post", "/api/transactions"),
+        ("get", "/api/labels"), ("post", "/api/labels"),
+        ("patch", "/api/labels/1"), ("delete", "/api/labels/1"),
+        ("get", "/api/transactions"), ("post", "/api/transactions"),
     ]:
         r = await client.request(method.upper(), path, json={"date": "2026-09-01"})
         assert r.status_code == 401, f"{method} {path}: {r.status_code}"
@@ -97,6 +98,38 @@ async def test_category_crud_and_409_guard(client):
     assert (await client.delete(f"/api/transactions/{txn['id']}")).status_code == 204
     assert (await client.delete(f"/api/categories/{transport}")).status_code == 204
     assert (await client.delete("/api/categories/999999")).status_code == 404
+
+
+@pytest.mark.anyio
+async def test_label_crud_and_409_guard(client):
+    await client.get("/api/auth/dev-login")
+
+    r = await client.post("/api/labels", json={"name": "cashback", "color": "#22c55e"})
+    assert r.status_code == 201, r.text
+    cashback = r.json()
+    assert cashback["is_spending"] is False and cashback["color"] == "#22c55e"
+    assert cashback["name"] in [l["name"] for l in (await client.get("/api/labels")).json()]
+
+    r = await client.post("/api/labels", json={"name": "cashback"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == "Label 'cashback' already exists"
+
+    r = await client.patch(f"/api/labels/{cashback['id']}", json={"name": "cash"})
+    assert r.status_code == 200 and r.json()["name"] == "cash"
+    assert (
+        await client.patch(f"/api/labels/{cashback['id']}", json={"name": "tip"})
+    ).status_code == 409
+    assert (await client.patch("/api/labels/999999", json={"name": "X"})).status_code == 404
+
+    # referenced -> 409 with the count, until nothing references it anymore
+    tip = await lid(client, "tip")
+    txn = await add_txn(client, label_id=tip)
+    r = await client.delete(f"/api/labels/{tip}")
+    assert r.status_code == 409
+    assert r.json()["detail"] == "Label in use by 1 transactions"
+    assert (await client.delete(f"/api/transactions/{txn['id']}")).status_code == 204
+    assert (await client.delete(f"/api/labels/{tip}")).status_code == 204
+    assert (await client.delete("/api/labels/999999")).status_code == 404
 
 
 @pytest.mark.anyio

@@ -50,7 +50,14 @@ class CategoryPatch(BaseModel):
     color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 
+class LabelCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    is_spending: bool = False
+    color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
+
+
 class LabelPatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)
     color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 
@@ -172,14 +179,41 @@ async def list_labels(db: AsyncSession = Depends(get_db)):
     return (await db.scalars(select(Label).order_by(Label.name))).all()
 
 
+@router.post("/labels", status_code=201, response_model=LabelOut)
+async def create_label(body: LabelCreate, db: AsyncSession = Depends(get_db)):
+    if await db.scalar(select(Label).where(Label.name == body.name)):
+        raise HTTPException(status_code=409, detail=f"Label '{body.name}' already exists")
+    label = Label(**body.model_dump())
+    db.add(label)
+    await db.commit()
+    await db.refresh(label)
+    return label
+
+
 @router.patch("/labels/{label_id}", response_model=LabelOut)
 async def update_label(label_id: int, body: LabelPatch, db: AsyncSession = Depends(get_db)):
     label = await _get_or_404(db, Label, label_id)
-    for key, value in body.model_dump(exclude_unset=True).items():
+    changes = body.model_dump(exclude_unset=True)
+    if (name := changes.get("name")) and name != label.name:
+        if await db.scalar(select(Label).where(Label.name == name)):
+            raise HTTPException(status_code=409, detail=f"Label '{name}' already exists")
+    for key, value in changes.items():
         setattr(label, key, value)
     await db.commit()
     await db.refresh(label)
     return label
+
+
+@router.delete("/labels/{label_id}", status_code=204)
+async def delete_label(label_id: int, db: AsyncSession = Depends(get_db)):
+    label = await _get_or_404(db, Label, label_id)
+    used = await db.scalar(
+        select(func.count()).select_from(Transaction).where(Transaction.label_id == label_id)
+    )
+    if used:
+        raise HTTPException(status_code=409, detail=f"Label in use by {used} transactions")
+    await db.delete(label)
+    await db.commit()
 
 
 # --- transactions ---
