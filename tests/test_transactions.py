@@ -121,6 +121,9 @@ async def test_label_crud_and_409_guard(client):
     ).status_code == 409
     assert (await client.patch("/api/labels/999999", json={"name": "X"})).status_code == 404
 
+    r = await client.patch(f"/api/labels/{cashback['id']}", json={"is_spending": True})
+    assert r.status_code == 200 and r.json()["is_spending"] is True
+
     # referenced -> 409 with the count, until nothing references it anymore
     tip = await lid(client, "tip")
     txn = await add_txn(client, label_id=tip)

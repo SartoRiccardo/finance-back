@@ -58,6 +58,7 @@ class LabelCreate(BaseModel):
 
 class LabelPatch(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=120)
+    is_spending: bool | None = None
     color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 
