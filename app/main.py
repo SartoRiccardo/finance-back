@@ -5,7 +5,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from app.auth import register_dev_login, router as auth_router
 from app.config import Settings, get_settings
@@ -49,6 +49,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Personal Finance API", lifespan=lifespan)
     app.state.settings = settings
     app.state.db_factory = SessionLocal  # detached work (draft extraction) uses this
+
+    @app.middleware("http")
+    async def no_store_for_api(request: Request, call_next):
+        # session-derived responses (auth state, the ledger) must never be cached
+        # by Cloudflare or the browser — a stale cached /api/auth/me is exactly
+        # what causes "login works but I still get bounced back to the login page"
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/api/health")
     async def health():
