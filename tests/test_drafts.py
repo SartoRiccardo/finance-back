@@ -90,11 +90,14 @@ async def cid(client, name: str) -> int:
 
 
 @pytest.mark.anyio
-async def test_custom_prompt_is_appended_to_extraction_prompt(dclient):
+async def test_custom_prompts_are_appended_to_extraction_prompt(dclient):
     await dclient.get("/api/auth/dev-login")
     r = await dclient.put("/api/settings", json={
         "llm_provider": "google", "llm_model": "gemini-2.5-flash",
-        "custom_prompt": "apple vinegar goes in Self Care",
+        "custom_prompts": [
+            "apple vinegar goes in Self Care",
+            "a discount applies to the item above:\nITEM A -> 3,00\nDISCOUNT -> -1,00",
+        ],
     })
     assert r.status_code == 200, r.text
 
@@ -105,7 +108,9 @@ async def test_custom_prompt_is_appended_to_extraction_prompt(dclient):
     assert (await wait_draft(dclient, r.json()["id"]))["status"] == "open"
 
     prompt = fake.calls[0][1][0]  # (schema, contents) → the text part
-    assert "apple vinegar goes in Self Care" in prompt
+    # each rule concatenated as a bullet, multi-line rules intact
+    assert "- apple vinegar goes in Self Care" in prompt
+    assert "- a discount applies to the item above:\nITEM A -> 3,00\nDISCOUNT -> -1,00" in prompt
     # appended after the JSON-shape instructions, not replacing them
     assert prompt.index("Respond with ONLY a JSON object") < prompt.index("apple vinegar")
 

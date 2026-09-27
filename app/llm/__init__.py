@@ -12,11 +12,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, DecimalException
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -206,15 +206,18 @@ async def ensure_app_settings(settings: Settings) -> None:
 class LLMSettingsOut(BaseModel):
     llm_provider: str
     llm_model: str
-    custom_prompt: str = ""
+    custom_prompts: list[str] = []
 
 
 class LLMSettingsIn(BaseModel):
     # Literal + length bounds are the validation: invalid → FastAPI's 422.
     llm_provider: Literal["google", "openrouter"]
     llm_model: str = Field(min_length=1, max_length=120)  # String(120) column
-    # None = untouched (a picker save carries only provider/model); "" clears.
-    custom_prompt: str | None = Field(default=None, max_length=2000)
+    # None = untouched (a picker save carries only provider/model); a list replaces
+    # the whole set. A rule may be multi-line; ≤500 chars each, ≤20 rules.
+    custom_prompts: list[Annotated[str, StringConstraints(max_length=500)]] | None = Field(
+        default=None, max_length=20
+    )
 
 
 router = APIRouter(tags=["settings"], dependencies=[Depends(get_current_user)])
@@ -225,14 +228,14 @@ async def read_llm_settings(
     db: AsyncSession = Depends(get_db), settings: Settings = Depends(get_app_settings)
 ):
     row = await db.get(AppSetting, 1)
-    if row is None:  # env defaults, no custom prompt
+    if row is None:  # env defaults, no custom rules
         return LLMSettingsOut(
             llm_provider=settings.llm_provider, llm_model=settings.llm_model
         )
     return LLMSettingsOut(
         llm_provider=row.llm_provider,
         llm_model=row.llm_model,
-        custom_prompt=row.custom_prompt or "",
+        custom_prompts=row.custom_prompts or [],
     )
 
 
@@ -243,13 +246,13 @@ async def update_llm_settings(body: LLMSettingsIn, db: AsyncSession = Depends(ge
         row = AppSetting(id=1)
         db.add(row)
     row.llm_provider, row.llm_model = body.llm_provider, body.llm_model
-    if body.custom_prompt is not None:
-        row.custom_prompt = body.custom_prompt.strip() or None
+    if body.custom_prompts is not None:
+        row.custom_prompts = [p.strip() for p in body.custom_prompts if p.strip()] or None
     await db.commit()
     return LLMSettingsOut(
         llm_provider=row.llm_provider,
         llm_model=row.llm_model,
-        custom_prompt=row.custom_prompt or "",
+        custom_prompts=row.custom_prompts or [],
     )
 
 

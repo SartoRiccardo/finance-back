@@ -165,8 +165,9 @@ class AppSetting(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     llm_provider: Mapped[str] = mapped_column(String(16), default="google", server_default="google")
     llm_model: Mapped[str] = mapped_column(String(120), default="gemini-2.5-flash", server_default="gemini-2.5-flash")
-    # free-text additions appended to the extraction prompt (e.g. where odd items belong)
-    custom_prompt: Mapped[str | None] = mapped_column(String(2000))
+    # per-rule additions appended to the extraction prompt (e.g. where odd items belong);
+    # list[str], concatenated as bullets at prompt time
+    custom_prompts: Mapped[list | None] = mapped_column(JsonDict)
 
 
 SEED_CATEGORIES = [

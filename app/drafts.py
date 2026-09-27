@@ -133,8 +133,11 @@ async def create_draft_from_content(
     contents = [f"{prompt}\n\n{shape}", payload]
     # The owner's own quirks (e.g. what odd items are) go last — they refine the mapping.
     row = await db.get(AppSetting, 1)
-    if row is not None and row.custom_prompt and row.custom_prompt.strip():
-        contents[0] += f"\n\nOwner's mapping rules (they win when a category fits):\n{row.custom_prompt.strip()}"
+    rules = [r.strip() for r in ((row.custom_prompts if row else None) or []) if r.strip()]
+    if rules:
+        contents[0] += "\n\nOwner's mapping rules (they win when a category fits):\n" + "\n".join(
+            f"- {r}" for r in rules
+        )
     raw, usage = await llm.complete_structured(rows_schema([c.name for c in categories]), contents)
     rows = _rows_from_llm(raw, cat_ids, cat_ids["misc"])
 
