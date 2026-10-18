@@ -36,6 +36,41 @@ IMAGE_EXTS = {
     "image/heic": ".heic", "image/heif": ".heif", "image/gif": ".gif",
 }
 MAX_AMOUNT = Decimal("9999999999.99")  # Numeric(12,2) ceiling
+MAX_PIXEL_EDGE = 2048  # receipts stay readable; iPhone 4K shots tile the model otherwise
+
+
+def _image_payload(path: Path, mime: str) -> tuple[bytes, str]:
+    """Stored image → bytes the model reads reliably: HEIC/HEIF → JPEG, any edge
+    over MAX_PIXEL_EDGE downscaled. Small provider-native images pass untouched.
+
+    Runs in a thread inside the extraction task — decoding a 12MP HEIC is ~50MB
+    of RAM the request path never sees. Prep failure degrades to raw bytes; the
+    provider gets today's behaviour instead of a lost draft.
+    """
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    try:
+        if mime in ("image/heic", "image/heif"):
+            from pillow_heif import register_heif_opener
+
+            register_heif_opener()
+        with Image.open(path) as img:
+            if mime not in ("image/heic", "image/heif") and max(img.size) <= MAX_PIXEL_EDGE:
+                return path.read_bytes(), mime  # already provider-native and model-sized
+            img.load()
+            img = ImageOps.exif_transpose(img)  # iPhone shots: orientation lives in EXIF
+            if max(img.size) > MAX_PIXEL_EDGE:
+                img.thumbnail((MAX_PIXEL_EDGE, MAX_PIXEL_EDGE), Image.Resampling.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            out = BytesIO()
+            img.save(out, "JPEG", quality=85)
+            return out.getvalue(), "image/jpeg"
+    except Exception as exc:
+        log.warning("image prep for %s failed (%s) — sending raw bytes", path.name, exc)
+        return path.read_bytes(), mime
 
 # V6 adds "email": <prompt> and passes a str payload; everything else is shared.
 EXTRACT_PROMPTS = {
@@ -249,13 +284,12 @@ async def _run_extraction(
 ) -> None:
     """Fill a processing draft. Any failure lands in draft.error — nothing is lost.
 
-    A Path payload is read here, off the request and in a thread — the request
-    hands over a filepath, never the image bytes.
+    A Path payload is read and prepared here, off the request and in a thread —
+    the request hands over a filepath, never the image bytes.
     """
     try:
         if isinstance(payload, Path):
-            data = await asyncio.to_thread(payload.read_bytes)
-            payload = (data, mime_type)
+            payload = await asyncio.to_thread(_image_payload, payload, mime_type)
         async with db_factory() as db:
             draft = await db.get(Draft, draft_id)
             await create_draft_from_content(

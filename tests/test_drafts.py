@@ -522,3 +522,37 @@ async def test_failed_duplicate_check_never_fails_the_draft(dclient, db):
         stored = await s.get(Draft, draft["id"])
         assert stored.status == "open" and stored.error is None
         assert len((await s.scalars(select(LLMUsage))).all()) == 1  # extraction only
+
+
+def test_image_payload(tmp_path):
+    """HEIC → JPEG; oversize → downscaled; small JPEG passes untouched."""
+    from io import BytesIO
+
+    from PIL import Image
+    from pillow_heif import register_heif_opener
+
+    from app.drafts import MAX_PIXEL_EDGE, _image_payload
+
+    register_heif_opener()  # the test saves a HEIF; the code under test registers before opening
+
+    # heic/heif always re-encoded to jpeg, even under the edge cap
+    heic = tmp_path / "r.heic"
+    Image.new("RGB", (100, 80), "white").save(heic, "HEIF")
+    data, mime = _image_payload(heic, "image/heic")
+    assert mime == "image/jpeg" and Image.open(BytesIO(data)).size == (100, 80)
+
+    # oversize jpeg downscaled, aspect kept
+    big = tmp_path / "big.jpg"
+    Image.new("RGB", (4000, 1000)).save(big, "JPEG")
+    data, mime = _image_payload(big, "image/jpeg")
+    assert Image.open(BytesIO(data)).size == (MAX_PIXEL_EDGE, MAX_PIXEL_EDGE // 4)
+
+    # small native jpeg: byte-identical passthrough, no recompression
+    small = tmp_path / "ok.jpg"
+    small.write_bytes(PNG)  # any bytes: not opened when mime+size say fine
+    assert _image_payload(small, "image/jpeg") == (PNG, "image/jpeg")
+
+    # unprep-able garbage degrades to raw bytes, never raises
+    junk = tmp_path / "junk.png"
+    junk.write_bytes(b"not an image")
+    assert _image_payload(junk, "image/png") == (b"not an image", "image/png")

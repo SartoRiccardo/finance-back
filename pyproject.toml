@@ -18,6 +18,8 @@ dependencies = [
     "imap-tools>=1.15.0",
     "markdownify>=1.2.3",
     "pypdf>=6.18.1",
+    "pillow>=13.0.0",
+    "pillow-heif>=1.8.1",
 ]
 
 [dependency-groups]
