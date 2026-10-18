@@ -242,12 +242,20 @@ async def _run_extraction(
     user_id: uuid.UUID,
     llm: LLMClient,
     source: str,
-    payload: str | tuple[bytes, str],
+    payload: str | Path,
+    mime_type: str | None,
     db_factory: async_sessionmaker,
     settings: Settings,
 ) -> None:
-    """Fill a processing draft. Any failure lands in draft.error — nothing is lost."""
+    """Fill a processing draft. Any failure lands in draft.error — nothing is lost.
+
+    A Path payload is read here, off the request and in a thread — the request
+    hands over a filepath, never the image bytes.
+    """
     try:
+        if isinstance(payload, Path):
+            data = await asyncio.to_thread(payload.read_bytes)
+            payload = (data, mime_type)
         async with db_factory() as db:
             draft = await db.get(Draft, draft_id)
             await create_draft_from_content(
@@ -293,25 +301,34 @@ async def create_upload(
 ):
     if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=422, detail="file must be an image (image/*)")
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=422, detail="file is empty")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="file must be 10MB or less")
-
-    ext = IMAGE_EXTS.get(file.content_type) or Path(file.filename or "").suffix.lower() or ".img"
     upload_id = uuid.uuid4()
-    upload = Upload(
+    ext = IMAGE_EXTS.get(file.content_type) or Path(file.filename or "").suffix.lower() or ".img"
+    path = Path(settings.upload_dir) / f"{upload_id}{ext}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    try:  # stream in chunks — never the whole image in request RAM, HEICs are chunky
+        with path.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="file must be 10MB or less")
+                await asyncio.to_thread(out.write, chunk)
+    except HTTPException:
+        path.unlink(missing_ok=True)
+        raise
+    if size == 0:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="file is empty")
+    if size == 0:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="file is empty")
+    db.add(Upload(
         id=upload_id,
-        stored_path=f"{upload_id}{ext}",
+        stored_path=path.name,
         original_name=file.filename,
         mime_type=file.content_type,
-        size_bytes=len(data),
-    )
-    directory = Path(settings.upload_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / upload.stored_path).write_bytes(data)
-    db.add(upload)
+        size_bytes=size,
+    ))
     await db.commit()
     return {"upload_id": str(upload_id)}
 
@@ -358,8 +375,7 @@ async def create_draft_from_upload(
     await db.commit()
     await db.refresh(draft, ["rows"])  # empty collection for DraftOut
     _spawn(_run_extraction(
-        draft.id, user.id, llm, "photo", (path.read_bytes(), upload.mime_type),
-        db_factory, settings,
+        draft.id, user.id, llm, "photo", path, upload.mime_type, db_factory, settings,
     ))
     return draft
 
